@@ -40,3 +40,11 @@ I (26457) wifi: station: 70:ef:00:43:96:67 join, AID=1, bg, 20
 I (26467) wifi softAP: station:70:ef:00:43:96:67 join, AID=1
 I (27657) tcpip_adapter: softAP assign IP to station,IP is: 192.168.4.2
 ```
+
+export IDF_PATH=~/esp/ESP8266_RTOS_SDK
+source /home/may/esp/ESP8266_RTOS_SDK/esp_idf_env/bin/activate
+export PATH="$HOME/esp/ESP8266_RTOS_SDK/xtensa-lx106-elf/bin:$PATH"
+xtensa-lx106-elf-gcc --version
+cd ~/esp/ESP8266_RTOS_SDK/examples/wifi/getting_started/station
+
+make flash
