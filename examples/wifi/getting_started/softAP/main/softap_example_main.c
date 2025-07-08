@@ -34,6 +34,9 @@
 #define CONFIG_EXAMPLE_IPV4        1
 #define NVS_NAMESPACE              "config"
 #define DEFAULT_BAUD_RATE          115200
+#define DEFAULT_STOP_BITS          UART_STOP_BITS_1
+#define DEFAULT_PARITY             UART_PARITY_DISABLE
+#define DEFAULT_DATA_BITS          UART_DATA_8_BITS
 #define BOOT_COUNT_KEY             "boot_count"
 #define BOOT_COUNT_THRESHOLD       6
 
@@ -43,7 +46,6 @@ static const char *TAG = "master";
 #define RECV_TIMEOUT_MS 5000
 #define UART_BUF_SIZE (1024)
 #define MAX_CLIENTS 4
-#define BAUD_RESPONSE_TIMEOUT_MS 2000
 #define UART_TX_TIMEOUT_TICKS (100 / portTICK_PERIOD_MS)
 
 #define LED_PIN GPIO_NUM_2
@@ -56,23 +58,26 @@ typedef struct {
     int sock;
     char ip[16];
     bool active;
-    bool responded;
 } client_t;
 
 static client_t clients[MAX_CLIENTS];
 static uint32_t current_baud_rate = DEFAULT_BAUD_RATE;
+static uint8_t current_stop_bits = DEFAULT_STOP_BITS;
+static uint8_t current_parity = DEFAULT_PARITY;
+static uint8_t current_data_bits = DEFAULT_DATA_BITS;
 static uint8_t debug_mode = 0;
 static SemaphoreHandle_t client_count_mutex;
 static int connected_clients = 0;
+static char current_ssid[32]; // Track current SSID
 
 /* Initialize UART0 */
 static void uart_init(uint32_t baud_rate)
 {
     uart_config_t uart_config = {
         .baud_rate = baud_rate,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
+        .data_bits = DEFAULT_DATA_BITS,
+        .parity = DEFAULT_PARITY,
+        .stop_bits = DEFAULT_STOP_BITS,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
     };
     esp_err_t err = uart_param_config(UART_NUM_0, &uart_config);
@@ -90,20 +95,33 @@ static void uart_init(uint32_t baud_rate)
 /* Initialize LED on GPIO2 and Button on GPIO0 */
 static void io_init(void)
 {
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << LED_PIN) | (1ULL << BUTTON_PIN),
+    // Configure LED as output
+    gpio_config_t led_conf = {
+        .pin_bit_mask = (1ULL << LED_PIN),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE
     };
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-    esp_err_t err = gpio_config(&io_conf);
+    esp_err_t err = gpio_config(&led_conf);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "GPIO config failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "LED GPIO config failed: %s", esp_err_to_name(err));
     }
     gpio_set_level(LED_PIN, 1); // LED off (active-low)
+
+    // Configure Button as input with pull-up
+    gpio_config_t button_conf = {
+        .pin_bit_mask = (1ULL << BUTTON_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    err = gpio_config(&button_conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Button GPIO config failed: %s", esp_err_to_name(err));
+    }
+    ESP_LOGI(TAG, "GPIO initialized: LED on GPIO%d (output), Button on GPIO%d (input with pull-up)", LED_PIN, BUTTON_PIN);
 }
 
 /* LED control task */
@@ -135,24 +153,29 @@ static void load_nvs_config(uint32_t *baud_rate, char *ssid, size_t ssid_len, ch
     if (err == ESP_OK) {
         size_t len = ssid_len;
         err = nvs_get_str(nvs_handle, "wifi_ssid", ssid, &len);
-        if (err != ESP_OK) {
+        if (err != ESP_OK || len == 0 || ssid[0] == '\0') {
+            ESP_LOGW(TAG, "NVS: Failed to read SSID or SSID empty, using default: %s", DEFAULT_ESP_WIFI_SSID);
             strlcpy(ssid, DEFAULT_ESP_WIFI_SSID, ssid_len);
         }
         len = pass_len;
         err = nvs_get_str(nvs_handle, "wifi_pass", password, &len);
-        if (err != ESP_OK) {
+        if (err != ESP_OK || len == 0 || password[0] == '\0') {
+            ESP_LOGW(TAG, "NVS: Failed to read password or password empty, using default: %s", DEFAULT_ESP_WIFI_PASS);
             strlcpy(password, DEFAULT_ESP_WIFI_PASS, pass_len);
         }
         err = nvs_get_u32(nvs_handle, "baud_rate", baud_rate);
         if (err != ESP_OK) {
+            ESP_LOGW(TAG, "NVS: Failed to read baud rate, using default: %u", DEFAULT_BAUD_RATE);
             *baud_rate = DEFAULT_BAUD_RATE;
         }
         err = nvs_get_u8(nvs_handle, "debug_mode", debug);
         if (err != ESP_OK) {
+            ESP_LOGW(TAG, "NVS: Failed to read debug mode, using default: 0");
             *debug = 0;
         }
         nvs_close(nvs_handle);
     } else {
+        ESP_LOGW(TAG, "NVS: Failed to open NVS (%s), using defaults", esp_err_to_name(err));
         *baud_rate = DEFAULT_BAUD_RATE;
         strlcpy(ssid, DEFAULT_ESP_WIFI_SSID, ssid_len);
         strlcpy(password, DEFAULT_ESP_WIFI_PASS, pass_len);
@@ -161,14 +184,19 @@ static void load_nvs_config(uint32_t *baud_rate, char *ssid, size_t ssid_len, ch
 
     size_t ssid_length = strlen(ssid);
     size_t pass_length = strlen(password);
-    if (ssid_length == 0 || ssid_length > 32) {
+    if (ssid_length == 0 || ssid_length > 32 || !isprint((unsigned char)ssid[0])) {
+        ESP_LOGW(TAG, "Invalid SSID in NVS: '%s', using default: %s", ssid, DEFAULT_ESP_WIFI_SSID);
         strlcpy(ssid, DEFAULT_ESP_WIFI_SSID, ssid_len);
     }
-    if (pass_length > 0 && (pass_length < 8 || pass_length > 64)) {
+    if (pass_length > 0 && (pass_length < 8 || pass_length > 64 || !isprint((unsigned char)password[0]))) {
+        ESP_LOGW(TAG, "Invalid password in NVS, using default: %s", DEFAULT_ESP_WIFI_PASS);
         strlcpy(password, DEFAULT_ESP_WIFI_PASS, pass_len);
     }
 
+    // Store current SSID for checking in button_task
+    strlcpy(current_ssid, ssid, sizeof(current_ssid));
     esp_log_level_set(TAG, *debug ? ESP_LOG_INFO : ESP_LOG_NONE);
+    ESP_LOGI(TAG, "Loaded SSID: %s, Password: %s, Baud: %u, Debug: %u", ssid, password, *baud_rate, *debug);
 }
 
 /* Save configurations to NVS */
@@ -177,20 +205,45 @@ static void save_nvs_config(uint32_t baud_rate, const char *ssid, const char *pa
     nvs_handle_t nvs_handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for saving config: %s", esp_err_to_name(err));
         return;
     }
-    if (ssid) nvs_set_str(nvs_handle, "wifi_ssid", ssid);
-    if (password) nvs_set_str(nvs_handle, "wifi_pass", password);
-    nvs_set_u32(nvs_handle, "baud_rate", baud_rate);
-    nvs_set_u8(nvs_handle, "debug_mode", debug);
+    if (ssid) {
+        err = nvs_set_str(nvs_handle, "wifi_ssid", ssid);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to save SSID to NVS: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "Saved SSID to NVS: %s", ssid);
+            strlcpy(current_ssid, ssid, sizeof(current_ssid)); // Update current_ssid
+        }
+    }
+    if (password) {
+        err = nvs_set_str(nvs_handle, "wifi_pass", password);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to save password to NVS: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "Saved password to NVS: %s", password);
+        }
+    }
+    err = nvs_set_u32(nvs_handle, "baud_rate", baud_rate);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save baud rate to NVS: %s", esp_err_to_name(err));
+    }
+    err = nvs_set_u8(nvs_handle, "debug_mode", debug);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save debug mode to NVS: %s", esp_err_to_name(err));
+    }
     err = nvs_commit(nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to commit NVS config: %s", esp_err_to_name(err));
+    }
     nvs_close(nvs_handle);
 }
 
 /* Handle boot count for factory reset */
 static void handle_boot_count(void)
 {
-    ESP_LOGI(TAG, "Set Boot count handle_boot_count");
+    ESP_LOGI(TAG, "Checking boot count");
     nvs_handle_t nvs_handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK) {
@@ -214,7 +267,6 @@ static void handle_boot_count(void)
         return;
     }
 
-    ESP_LOGI(TAG, "Read Boot count: %u", boot_count);
     err = nvs_commit(nvs_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to commit boot count: %s", esp_err_to_name(err));
@@ -222,7 +274,7 @@ static void handle_boot_count(void)
         return;
     }
 
-    ESP_LOGI(TAG, "Set Boot count: %u", boot_count);
+    ESP_LOGI(TAG, "Boot count: %u", boot_count);
 
     if (boot_count > BOOT_COUNT_THRESHOLD) {
         ESP_LOGW(TAG, "Boot count %u exceeds threshold %d, resetting to factory defaults", 
@@ -261,13 +313,12 @@ static bool has_connected_clients(void)
     return false;
 }
 
-/* Broadcast data to all clients except the sender, wait for responses */
-static bool broadcast_and_wait(const char *data, size_t len, int sender_sock)
+/* Broadcast data to all clients except the sender */
+static void broadcast_data(const char *data, size_t len, int sender_sock)
 {
     char log_prefix[64];
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].active && clients[i].sock != sender_sock) {
-            clients[i].responded = false;
             int err = send(clients[i].sock, data, len, 0);
             get_log_prefix(log_prefix, sizeof(log_prefix), clients[i].ip);
             if (err < 0) {
@@ -275,32 +326,15 @@ static bool broadcast_and_wait(const char *data, size_t len, int sender_sock)
                 shutdown(clients[i].sock, SHUT_RDWR);
                 close(clients[i].sock);
                 clients[i].active = false;
-                clients[i].responded = false;
                 if (xSemaphoreTake(client_count_mutex, portMAX_DELAY) == pdTRUE) {
                     connected_clients--;
                     xSemaphoreGive(client_count_mutex);
                 }
+            } else {
+                ESP_LOGI(TAG, "%s Sent to client: %s", log_prefix, data);
             }
         }
     }
-
-    int timeout_ms = BAUD_RESPONSE_TIMEOUT_MS;
-    bool all_responded = false;
-    while (timeout_ms > 0) {
-        all_responded = true;
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (clients[i].active && clients[i].sock != sender_sock && !clients[i].responded) {
-                all_responded = false;
-                break;
-            }
-        }
-        if (all_responded) {
-            break;
-        }
-        vTaskDelay(100 / portTICK_PERIOD_MS);
-        timeout_ms -= 100;
-    }
-    return all_responded;
 }
 
 /* Print raw log without formatting to UART0 */
@@ -343,36 +377,65 @@ static void button_task(void *pvParameters)
 {
     TickType_t last_press_time = 0;
     bool last_state = true;
+    char log_prefix[64];
+    get_log_prefix(log_prefix, sizeof(log_prefix), "0.0.0.0");
+
     while (1) {
         bool current_state = gpio_get_level(BUTTON_PIN);
         if (last_state && !current_state) {
             last_press_time = xTaskGetTickCount();
+            ESP_LOGI(TAG, "%s Button press detected (GPIO%d low)", log_prefix, BUTTON_PIN);
         } else if (!last_state && current_state) {
             TickType_t press_duration = xTaskGetTickCount() - last_press_time;
-            if (press_duration < pdMS_TO_TICKS(BUTTON_CLICK_THRESHOLD_MS) && has_connected_clients()) {
-                uint8_t mac[6];
-                char new_ssid[32];
-                char new_password[64];
-                char mac_str[13];
-                esp_wifi_get_mac(WIFI_IF_AP, mac);
-                snprintf(mac_str, sizeof(mac_str), "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-                snprintf(new_ssid, sizeof(new_ssid), "FUNLIGHT-%s", &mac_str[8]);
-                snprintf(new_password, sizeof(new_password), "funlight-%s", &mac_str[8]);
-                char log_prefix[64];
-                get_log_prefix(log_prefix, sizeof(log_prefix), "0.0.0.0");
-                ESP_LOGI(TAG, "%s Button click detected, updating WiFi SSID:%s, password:%s", log_prefix, new_ssid, new_password);
-                char message[128];
-                snprintf(message, sizeof(message), "WIFI=%s,%s\r\n", new_ssid, new_password);
-                if (broadcast_and_wait(message, strlen(message), -1)) {
-                    save_nvs_config(current_baud_rate, new_ssid, new_password, debug_mode);
+            ESP_LOGI(TAG, "%s Button release detected, duration: %u ms", log_prefix, press_duration * portTICK_PERIOD_MS);
+
+            if (press_duration < pdMS_TO_TICKS(BUTTON_CLICK_THRESHOLD_MS)) {
+                if (has_connected_clients()) {
+                    ESP_LOGI(TAG, "%s Valid button click, current SSID: %s, connected clients: %d", 
+                             log_prefix, current_ssid, connected_clients);
+
+                    // Generate new SSID and password based on MAC address
+                    uint8_t mac[6];
+                    char new_ssid[32];
+                    char new_password[64];
+                    char mac_str[13];
+                    esp_err_t err = esp_wifi_get_mac(WIFI_IF_AP, mac);
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "%s Failed to get MAC address: %s", log_prefix, esp_err_to_name(err));
+                        print_raw_log("Failed to get MAC address\r\n");
+                        continue;
+                    }
+                    snprintf(mac_str, sizeof(mac_str), "%02X%02X", mac[4], mac[5]);
+                    snprintf(new_ssid, sizeof(new_ssid), "FUNLIGHT-%s", mac_str);
+                    snprintf(new_password, sizeof(new_password), "funlight-%s", mac_str);
+
+                    // Send WIFI=FUNLIGHT-xxxx,funlight-xxxx\r\n to all clients
+                    char wifi_cmd[128];
+                    snprintf(wifi_cmd, sizeof(wifi_cmd), "WIFI=%s,%s\r\n", new_ssid, new_password);
+                    broadcast_data(wifi_cmd, strlen(wifi_cmd), -1);
+                    ESP_LOGI(TAG, "%s Sent WiFi credentials to clients: %s", log_prefix, wifi_cmd);
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    // Only update master's SSID if it is currently FUNLIGHT
+                    if (strcmp(current_ssid, DEFAULT_ESP_WIFI_SSID) == 0) {
+                        ESP_LOGI(TAG, "%s Current SSID is %s, updating to %s", log_prefix, current_ssid, new_ssid);
+                        save_nvs_config(current_baud_rate, new_ssid, new_password, debug_mode);
+                    } else {
+                        ESP_LOGI(TAG, "%s Current SSID is %s (not %s), skipping SSID update", 
+                                 log_prefix, current_ssid, DEFAULT_ESP_WIFI_SSID);
+                    }
+
                     print_raw_log("OK\r\n");
-                    ESP_LOGI(TAG, "%s WiFi credentials saved, restarting in 1000ms", log_prefix);
+                    ESP_LOGI(TAG, "%s WiFi credentials sent, restarting in 1000ms", log_prefix);
                     vTaskDelay(pdMS_TO_TICKS(1000));
                     esp_restart();
                 } else {
-                    ESP_LOGE(TAG, "%s Failed to save WiFi credentials, not restarting", log_prefix);
-                    print_raw_log("Failed to save WiFi credentials, not restarting\r\n");
+                    ESP_LOGW(TAG, "%s Button click ignored: No clients connected", log_prefix);
+                    print_raw_log("No clients connected\r\n");
                 }
+            } else {
+                ESP_LOGW(TAG, "%s Button press too long (%u ms), ignored", 
+                         log_prefix, press_duration * portTICK_PERIOD_MS);
+                print_raw_log("Button press too long\r\n");
             }
         }
         last_state = current_state;
@@ -405,19 +468,15 @@ static void uart_command_task(void *pvParameters)
                 }
                 uint32_t new_baud = atoi(cmd + 5);
                 if (new_baud >= 9600 && new_baud <= 921600) {
-                    snprintf(response, sizeof(response), "BAUD=%u\r\n", new_baud);
-                    if (broadcast_and_wait(response, strlen(response), -1)) {
-                        get_log_prefix(log_prefix, sizeof(log_prefix), "0.0.0.0");
-                        ESP_LOGI(TAG, "%s Changing baud rate to %u", log_prefix, new_baud);
-                        uart_set_baudrate(UART_NUM_0, new_baud);
-                        current_baud_rate = new_baud;
-                        save_nvs_config(new_baud, NULL, NULL, debug_mode);
-                        print_raw_log("OK\r\n");
-                    } else {
-                        get_log_prefix(log_prefix, sizeof(log_prefix), "0.0.0.0");
-                        ESP_LOGE(TAG, "%s Not all clients responded, baud rate change aborted", log_prefix);
-                        print_raw_log("Not all clients responded, baud rate change aborted\r\n");
-                    }
+                    get_log_prefix(log_prefix, sizeof(log_prefix), "0.0.0.0");
+                    ESP_LOGI(TAG, "%s Changing baud rate to %u", log_prefix, new_baud);
+                    snprintf(response, sizeof(response), "BAUD=%u,STOPBIT=%u,PARITY=%u,DATABIT=%u\r\n", 
+                             new_baud, current_stop_bits - 1, current_parity == UART_PARITY_DISABLE ? 0 : (current_parity == UART_PARITY_EVEN ? 2 : 1), current_data_bits + 5);
+                    broadcast_data(response, strlen(response), -1);
+                    uart_set_baudrate(UART_NUM_0, new_baud);
+                    current_baud_rate = new_baud;
+                    save_nvs_config(new_baud, NULL, NULL, debug_mode);
+                    print_raw_log("OK\r\n");
                 } else {
                     get_log_prefix(log_prefix, sizeof(log_prefix), "0.0.0.0");
                     ESP_LOGE(TAG, "%s Invalid baud rate: %s", log_prefix, cmd + 5);
@@ -449,18 +508,13 @@ static void uart_command_task(void *pvParameters)
                         continue;
                     }
                     snprintf(response, sizeof(response), "WIFI=%s,%s\r\n", ssid, password);
-                    if (broadcast_and_wait(response, strlen(response), -1)) {
-                        get_log_prefix(log_prefix, sizeof(log_prefix), "0.0.0.0");
-                        ESP_LOGI(TAG, "%s WiFi configured: SSID=%s, restarting...", log_prefix, ssid);
-                        save_nvs_config(current_baud_rate, ssid, password, debug_mode);
-                        print_raw_log("OK\r\n");
-                        vTaskDelay(1000 / portTICK_PERIOD_MS);
-                        esp_restart();
-                    } else {
-                        get_log_prefix(log_prefix, sizeof(log_prefix), "0.0.0.0");
-                        ESP_LOGE(TAG, "%s Not all clients responded, WiFi configuration aborted", log_prefix);
-                        print_raw_log("Not all clients connected, WiFi configuration aborted\r\n");
-                    }
+                    broadcast_data(response, strlen(response), -1);
+                    get_log_prefix(log_prefix, sizeof(log_prefix), "0.0.0.0");
+                    ESP_LOGI(TAG, "%s WiFi configured: SSID=%s, restarting...", log_prefix, ssid);
+                    save_nvs_config(current_baud_rate, ssid, password, debug_mode);
+                    print_raw_log("OK\r\n");
+                    vTaskDelay(1000 / portTICK_PERIOD_MS);
+                    esp_restart();
                 } else {
                     get_log_prefix(log_prefix, sizeof(log_prefix), "0.0.0.0");
                     ESP_LOGE(TAG, "%s Invalid WIFI command format", log_prefix);
@@ -474,18 +528,13 @@ static void uart_command_task(void *pvParameters)
                 uint8_t new_debug = atoi(cmd + 6);
                 if (new_debug == 0 || new_debug == 1) {
                     snprintf(response, sizeof(response), "DEBUG=%u\r\n", new_debug);
-                    if (broadcast_and_wait(response, strlen(response), -1)) {
-                        get_log_prefix(log_prefix, sizeof(log_prefix), "0.0.0.0");
-                        ESP_LOGI(TAG, "%s Changing debug mode to %u", log_prefix, new_debug);
-                        debug_mode = new_debug;
-                        esp_log_level_set(TAG, debug_mode ? ESP_LOG_INFO : ESP_LOG_NONE);
-                        save_nvs_config(current_baud_rate, NULL, NULL, debug_mode);
-                        print_raw_log("OK\r\n");
-                    } else {
-                        get_log_prefix(log_prefix, sizeof(log_prefix), "0.0.0.0");
-                        ESP_LOGE(TAG, "%s Not all clients responded, debug mode change aborted", log_prefix);
-                        print_raw_log("Not all clients responded, debug mode change aborted\r\n");
-                    }
+                    broadcast_data(response, strlen(response), -1);
+                    get_log_prefix(log_prefix, sizeof(log_prefix), "0.0.0.0");
+                    ESP_LOGI(TAG, "%s Changing debug mode to %u", log_prefix, new_debug);
+                    debug_mode = new_debug;
+                    esp_log_level_set(TAG, debug_mode ? ESP_LOG_INFO : ESP_LOG_NONE);
+                    save_nvs_config(current_baud_rate, NULL, NULL, debug_mode);
+                    print_raw_log("OK\r\n");
                 } else {
                     get_log_prefix(log_prefix, sizeof(log_prefix), "0.0.0.0");
                     ESP_LOGE(TAG, "%s Invalid debug mode: %s", log_prefix, cmd + 6);
@@ -512,7 +561,6 @@ static void uart_command_task(void *pvParameters)
                             shutdown(clients[i].sock, SHUT_RDWR);
                             close(clients[i].sock);
                             clients[i].active = false;
-                            clients[i].responded = false;
                             if (xSemaphoreTake(client_count_mutex, portMAX_DELAY) == pdTRUE) {
                                 connected_clients--;
                                 xSemaphoreGive(client_count_mutex);
@@ -540,7 +588,6 @@ static void tcp_server_task(void *pvParameters)
     for (int i = 0; i < MAX_CLIENTS; i++) {
         clients[i].sock = -1;
         clients[i].active = false;
-        clients[i].responded = false;
     }
 
     while (1) {
@@ -595,7 +642,6 @@ static void tcp_server_task(void *pvParameters)
                 client_idx = i;
                 clients[i].sock = sock;
                 clients[i].active = true;
-                clients[i].responded = false;
                 strlcpy(clients[i].ip, addr_str, sizeof(clients[i].ip));
                 break;
             }
@@ -641,22 +687,18 @@ static void tcp_server_task(void *pvParameters)
             } else {
                 rx_buffer[len] = 0;
                 get_log_prefix(log_prefix, sizeof(log_prefix), addr_str);
-                if (strcmp(rx_buffer, "OK\r\n") == 0) {
-                    clients[client_idx].responded = true;
-                } else if (strncmp(rx_buffer, "BAUD=", 5) == 0) {
+                if (strncmp(rx_buffer, "BAUD=", 5) == 0) {
                     uint32_t new_baud = atoi(rx_buffer + 5);
                     if (new_baud >= 300 && new_baud <= 2000000) {
                         ESP_LOGI(TAG, "%s Received client baud rate change request: %u", log_prefix, new_baud);
-                        if (broadcast_and_wait(rx_buffer, len, sock)) {
-                            ESP_LOGI(TAG, "%s Changing baud rate to %u", log_prefix, new_baud);
-                            uart_set_baudrate(UART_NUM_0, new_baud);
-                            current_baud_rate = new_baud;
-                            save_nvs_config(new_baud, NULL, NULL, debug_mode);
-                            send(sock, "OK\r\n", 4, 0);
-                        } else {
-                            ESP_LOGE(TAG, "%s Not all clients responded, baud rate change aborted", log_prefix);
-                            send(sock, "Not all clients responded, baud rate change aborted\r\n", 52, 0);
-                        }
+                        snprintf(rx_buffer, sizeof(rx_buffer), "BAUD=%u,STOPBIT=%u,PARITY=%u,DATABIT=%u\r\n", 
+                                 new_baud, current_stop_bits - 1, current_parity == UART_PARITY_DISABLE ? 0 : (current_parity == UART_PARITY_EVEN ? 2 : 1), current_data_bits + 5);
+                        broadcast_data(rx_buffer, strlen(rx_buffer), sock);
+                        ESP_LOGI(TAG, "%s Changing baud rate to %u", log_prefix, new_baud);
+                        uart_set_baudrate(UART_NUM_0, new_baud);
+                        current_baud_rate = new_baud;
+                        save_nvs_config(new_baud, NULL, NULL, debug_mode);
+                        send(sock, "OK\r\n", 4, 0);
                     } else {
                         ESP_LOGE(TAG, "%s Invalid baud rate: %s", log_prefix, rx_buffer + 5);
                         send(sock, "Invalid baud rate\r\n", 19, 0);
@@ -680,16 +722,12 @@ static void tcp_server_task(void *pvParameters)
                             send(sock, "Invalid password\r\n", 18, 0);
                             continue;
                         }
-                        if (broadcast_and_wait(rx_buffer, len, sock)) {
-                            ESP_LOGI(TAG, "%s WiFi configured: SSID=%s, restarting...", log_prefix, ssid);
-                            save_nvs_config(current_baud_rate, ssid, password, debug_mode);
-                            send(sock, "OK\r\n", 4, 0);
-                            vTaskDelay(1000 / portTICK_PERIOD_MS);
-                            esp_restart();
-                        } else {
-                            ESP_LOGE(TAG, "%s Not all clients responded, WiFi configuration aborted", log_prefix);
-                            send(sock, "Not all clients responded, WiFi configuration aborted\r\n", 52, 0);
-                        }
+                        broadcast_data(rx_buffer, len, sock);
+                        ESP_LOGI(TAG, "%s WiFi configured: SSID=%s, restarting...", log_prefix, ssid);
+                        save_nvs_config(current_baud_rate, ssid, password, debug_mode);
+                        send(sock, "OK\r\n", 4, 0);
+                        vTaskDelay(1000 / portTICK_PERIOD_MS);
+                        esp_restart();
                     } else {
                         ESP_LOGE(TAG, "%s Invalid WIFI command format", log_prefix);
                         send(sock, "Invalid WIFI command format\r\n", 29, 0);
@@ -698,16 +736,12 @@ static void tcp_server_task(void *pvParameters)
                     uint8_t new_debug = atoi(rx_buffer + 6);
                     if (new_debug == 0 || new_debug == 1) {
                         ESP_LOGI(TAG, "%s Received client debug mode change request: %u", log_prefix, new_debug);
-                        if (broadcast_and_wait(rx_buffer, len, sock)) {
-                            ESP_LOGI(TAG, "%s Changing debug mode to %u", log_prefix, new_debug);
-                            debug_mode = new_debug;
-                            esp_log_level_set(TAG, debug_mode ? ESP_LOG_INFO : ESP_LOG_NONE);
-                            save_nvs_config(current_baud_rate, NULL, NULL, debug_mode);
-                            send(sock, "OK\r\n", 4, 0);
-                        } else {
-                            ESP_LOGE(TAG, "%s Not all clients responded, debug mode change aborted", log_prefix);
-                            send(sock, "Not all clients responded, debug mode change aborted\r\n", 52, 0);
-                        }
+                        broadcast_data(rx_buffer, len, sock);
+                        ESP_LOGI(TAG, "%s Changing debug mode to %u", log_prefix, new_debug);
+                        debug_mode = new_debug;
+                        esp_log_level_set(TAG, debug_mode ? ESP_LOG_INFO : ESP_LOG_NONE);
+                        save_nvs_config(current_baud_rate, NULL, NULL, debug_mode);
+                        send(sock, "OK\r\n", 4, 0);
                     } else {
                         ESP_LOGE(TAG, "%s Invalid debug mode: %s", log_prefix, rx_buffer + 6);
                         send(sock, "Invalid debug mode\r\n", 20, 0);
@@ -733,7 +767,6 @@ static void tcp_server_task(void *pvParameters)
                                 shutdown(clients[i].sock, SHUT_RDWR);
                                 close(clients[i].sock);
                                 clients[i].active = false;
-                                clients[i].responded = false;
                                 if (xSemaphoreTake(client_count_mutex, portMAX_DELAY) == pdTRUE) {
                                     connected_clients--;
                                     xSemaphoreGive(client_count_mutex);
@@ -749,7 +782,6 @@ static void tcp_server_task(void *pvParameters)
             shutdown(sock, SHUT_RDWR);
             close(sock);
             clients[client_idx].active = false;
-            clients[client_idx].responded = false;
             if (xSemaphoreTake(client_count_mutex, portMAX_DELAY) == pdTRUE) {
                 connected_clients--;
                 xSemaphoreGive(client_count_mutex);
@@ -806,7 +838,7 @@ static void wifi_init_softap(const char *ssid, const char *password)
     wifi_config_t wifi_config = {
         .ap = {
             .ssid_len = strlen(ssid),
-            .channel = 1,
+            .channel = 11,
             .authmode = WIFI_AUTH_WPA2_PSK,
             .max_connection = EXAMPLE_MAX_STA_CONN
         },
@@ -829,15 +861,18 @@ static void wifi_init_softap(const char *ssid, const char *password)
         ESP_LOGE(TAG, "WiFi start failed: %s", esp_err_to_name(err));
         return;
     }
+    ESP_LOGI(TAG, "WiFi SoftAP started with SSID: %s", ssid);
 }
 
 void app_main(void)
 {
     esp_err_t err = nvs_flash_init();
     if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS init failed: %s, erasing and retrying", esp_err_to_name(err));
         nvs_flash_erase();
         err = nvs_flash_init();
         if (err != ESP_OK) {
+            ESP_LOGE(TAG, "NVS flash init failed after erase: %s", esp_err_to_name(err));
             return;
         }
     }
@@ -860,5 +895,5 @@ void app_main(void)
     xTaskCreate(tcp_server_task, "tcp_server", 4096, NULL, 5, NULL);
     xTaskCreate(uart_command_task, "uart_command", 4096, NULL, 5, NULL);
     xTaskCreate(led_task, "led_task", 2048, NULL, 4, NULL);
-    xTaskCreate(button_task, "button_task", 2048, NULL, 4, NULL);
+    xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
 }

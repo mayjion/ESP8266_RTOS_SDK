@@ -792,7 +792,7 @@ void wifi_init_sta(const char *ssid, const char *password)
 
     wifi_config_t wifi_config = {
         .sta = {
-            .channel = 1,
+            .channel = 11,
             .threshold.authmode = WIFI_AUTH_WPA2_PSK
         },
     };
