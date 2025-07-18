@@ -1,0 +1,8 @@
+python -m esptool --chip esp8266 merge_bin \
+  -o esp8266_merged_firmware_dout_40m_1mb_20250708.bin \
+  --flash_mode dout \
+  --flash_freq 40m \
+  --flash_size 1MB \
+  0x0 /home/may/esp/ESP8266_RTOS_SDK/examples/wifi/getting_started/softAP/build/bootloader/bootloader.bin \
+  0x8000 /home/may/esp/ESP8266_RTOS_SDK/examples/wifi/getting_started/softAP/build/partitions_singleapp.bin \
+  0x10000 /home/may/esp/ESP8266_RTOS_SDK/examples/wifi/getting_started/softAP/build/wifi_softAP.bin
