@@ -191,29 +191,8 @@ static void save_nvs_config(uint32_t baud_rate, uint8_t stop_bits, uint8_t parit
     nvs_close(nvs_handle);
 }
 
-/* Reset to factory defaults */
-static void reset_to_defaults(void)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for reset: %s", esp_err_to_name(err));
-        return;
-    }
-    err = nvs_erase_all(nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to erase NVS: %s", esp_err_to_name(err));
-    }
-    err = nvs_commit(nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to commit NVS erase: %s", esp_err_to_name(err));
-    }
-    nvs_close(nvs_handle);
-    ESP_LOGI(TAG, "Factory reset completed, restarting...");
-    esp_restart();
-}
-
-/* Print raw log without formatting to UART0 */
+/* Print raw data (binary-safe) to UART0 */
+// FIX: Renamed and modified to handle binary data with explicit length, avoiding strlen which stops at 0x00.
 static SemaphoreHandle_t raw_log_mutex = NULL;
 
 static void raw_log_init(void)
@@ -226,9 +205,9 @@ static void raw_log_init(void)
     }
 }
 
-static void print_raw_log(const char *data)
+static void print_raw_data(const uint8_t *data, size_t len)
 {
-    if (!data) return;
+    if (!data || len == 0) return;
 
     static bool initialized = false;
     if (!initialized) {
@@ -236,18 +215,15 @@ static void print_raw_log(const char *data)
         initialized = true;
     }
 
-    size_t len = strlen(data);
-
     if (raw_log_mutex && xSemaphoreTake(raw_log_mutex, portMAX_DELAY) == pdTRUE) {
-        uart_write_bytes(UART_NUM_0, data, len);
+        uart_write_bytes(UART_NUM_0, (const char *)data, len); // FIX: Cast to const char *
         uart_wait_tx_done(UART_NUM_0, 100 / portTICK_PERIOD_MS);
         xSemaphoreGive(raw_log_mutex);
     } else {
-        uart_write_bytes(UART_NUM_0, data, len);
+        uart_write_bytes(UART_NUM_0, (const char *)data, len); // FIX: Cast to const char *
         uart_wait_tx_done(UART_NUM_0, 100 / portTICK_PERIOD_MS);
     }
 }
-
 /* TCP send data with optional response expectation */
 static esp_err_t tcp_send_data(int sock, const char *payload, size_t payload_len, char *rx_buffer, size_t rx_buffer_size, bool expect_response)
 {
@@ -276,66 +252,83 @@ static esp_err_t tcp_send_data(int sock, const char *payload, size_t payload_len
         return ESP_FAIL;
     }
 
-    rx_buffer[len] = 0;
-    print_raw_log(rx_buffer);
+    // FIX: Use print_raw_data with length for binary safety
+    print_raw_data((uint8_t *)rx_buffer, len);
     return ESP_OK;
 }
 
-/* TCP receive task */
-/* Parse and process TCP commands */
-static esp_err_t parse_tcp_command(int sock, char *rx_buffer, size_t len)
+static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t len)
 {
     if (!rx_buffer || len == 0) {
         return ESP_FAIL;
     }
 
-    // Trim buffer to first command (in case of duplicates or extra data)
-    char *cmd_end = strstr(rx_buffer, "\r\n");
-    if (cmd_end) {
-        *cmd_end = 0; // Terminate at first \r\n
-        len = cmd_end - rx_buffer;
-    }
+    // Check if potential BAUD command
+    if (len >= 5 && memcmp(rx_buffer, "BAUD=", 5) == 0) {
+        // Check for embedded 0x00; if present, treat as transparent binary data
+        if (memchr(rx_buffer, 0, len) != NULL) {
+            print_raw_data(rx_buffer, len);
+            return ESP_OK;
+        }
 
-    if (strncmp(rx_buffer, "BAUD=", 5) == 0) {
-        // Regex pattern to match BAUD=<number>,STOPBIT=<number>,PARITY=<number>,DATABIT=<number> with optional \r\n
+        // Safe to make null-terminated copy
+        char *buf = (char *)malloc(len + 1);
+        if (!buf) {
+            ESP_LOGE(TAG, "Failed to allocate buf for command");
+            return ESP_FAIL;
+        }
+        memcpy(buf, rx_buffer, len);
+        buf[len] = 0;
+
+        // Trim to first \r\n if present
+        char *cmd_end = strstr(buf, "\r\n");
+        if (cmd_end) {
+            *cmd_end = 0;
+        }
+
+        // Regex pattern
         const char *pattern = "^BAUD=([0-9]+),STOPBIT=([0-9]+),PARITY=([0-9]+),DATABIT=([0-9]+)(\r\n)?$";
         regex_t regex;
-        regmatch_t matches[5]; // 5 groups: whole string, BAUD, STOPBIT, PARITY, DATABIT
+        regmatch_t matches[5];
         int ret = regcomp(&regex, pattern, REG_EXTENDED);
         if (ret != 0) {
             ESP_LOGE(TAG, "Failed to compile regex: %d", ret);
             const char *response = "Internal error: regex compilation failed\r\n";
             send(sock, response, strlen(response), 0);
+            free(buf);
+            regfree(&regex);
             return ESP_FAIL;
         }
 
-        ret = regexec(&regex, rx_buffer, 5, matches, 0);
+        ret = regexec(&regex, buf, 5, matches, 0);
         if (ret != 0) {
-            ESP_LOGE(TAG, "Invalid BAUD command format: no match for '%s'", rx_buffer);
+            ESP_LOGE(TAG, "Invalid BAUD command format: no match for '%s'", buf);
             const char *response = "Invalid BAUD command format\r\n";
             send(sock, response, strlen(response), 0);
+            free(buf);
             regfree(&regex);
             return ESP_FAIL;
         }
 
         // Extract and convert each field
         char *endptr;
-        // BAUD
         char baud_str[32] = {0};
         size_t baud_len = matches[1].rm_eo - matches[1].rm_so;
         if (baud_len >= sizeof(baud_str)) {
             ESP_LOGE(TAG, "BAUD value too long");
             const char *response = "Invalid baud rate\r\n";
             send(sock, response, strlen(response), 0);
+            free(buf);
             regfree(&regex);
             return ESP_FAIL;
         }
-        strncpy(baud_str, rx_buffer + matches[1].rm_so, baud_len);
+        strncpy(baud_str, buf + matches[1].rm_so, baud_len);
         uint32_t new_baud = strtoul(baud_str, &endptr, 10);
         if (*endptr != 0) {
             ESP_LOGE(TAG, "Invalid BAUD value: non-numeric '%s'", baud_str);
             const char *response = "Invalid baud rate\r\n";
             send(sock, response, strlen(response), 0);
+            free(buf);
             regfree(&regex);
             return ESP_FAIL;
         }
@@ -347,15 +340,17 @@ static esp_err_t parse_tcp_command(int sock, char *rx_buffer, size_t len)
             ESP_LOGE(TAG, "STOPBIT value too long");
             const char *response = "Invalid stop bits\r\n";
             send(sock, response, strlen(response), 0);
+            free(buf);
             regfree(&regex);
             return ESP_FAIL;
         }
-        strncpy(stopbit_str, rx_buffer + matches[2].rm_so, stopbit_len);
+        strncpy(stopbit_str, buf + matches[2].rm_so, stopbit_len);
         uint8_t raw_stop_bits = strtoul(stopbit_str, &endptr, 10);
         if (*endptr != 0) {
             ESP_LOGE(TAG, "Invalid STOPBIT value: non-numeric '%s'", stopbit_str);
             const char *response = "Invalid stop bits\r\n";
             send(sock, response, strlen(response), 0);
+            free(buf);
             regfree(&regex);
             return ESP_FAIL;
         }
@@ -368,15 +363,17 @@ static esp_err_t parse_tcp_command(int sock, char *rx_buffer, size_t len)
             ESP_LOGE(TAG, "PARITY value too long");
             const char *response = "Invalid parity\r\n";
             send(sock, response, strlen(response), 0);
+            free(buf);
             regfree(&regex);
             return ESP_FAIL;
         }
-        strncpy(parity_str, rx_buffer + matches[3].rm_so, parity_len);
+        strncpy(parity_str, buf + matches[3].rm_so, parity_len);
         uint8_t new_parity = strtoul(parity_str, &endptr, 10);
         if (*endptr != 0) {
             ESP_LOGE(TAG, "Invalid PARITY value: non-numeric '%s'", parity_str);
             const char *response = "Invalid parity\r\n";
             send(sock, response, strlen(response), 0);
+            free(buf);
             regfree(&regex);
             return ESP_FAIL;
         }
@@ -389,23 +386,23 @@ static esp_err_t parse_tcp_command(int sock, char *rx_buffer, size_t len)
             ESP_LOGE(TAG, "DATABIT value too long");
             const char *response = "Invalid data bits\r\n";
             send(sock, response, strlen(response), 0);
+            free(buf);
             regfree(&regex);
             return ESP_FAIL;
         }
-        strncpy(databit_str, rx_buffer + matches[4].rm_so, databit_len);
-        uint8_t new_data_bits = strtoul(databit_str, &endptr, 10);
+        strncpy(databit_str, buf + matches[4].rm_so, databit_len);
+        uint8_t raw_data_bits = strtoul(databit_str, &endptr, 10);
         if (*endptr != 0) {
             ESP_LOGE(TAG, "Invalid DATABIT value: non-numeric '%s'", databit_str);
             const char *response = "Invalid data bits\r\n";
             send(sock, response, strlen(response), 0);
+            free(buf);
             regfree(&regex);
             return ESP_FAIL;
         }
 
         regfree(&regex);
-
-        // ESP_LOGI(TAG, "Received server UART config: BAUD=%u, STOPBIT=%u (raw=%u), PARITY=%u, DATABIT=%u",
-        //          new_baud, new_stop_bits, raw_stop_bits, new_parity, new_data_bits);
+        free(buf);
 
         // Validate parameters
         if (new_baud < 110 || new_baud > 2000000) {
@@ -429,13 +426,15 @@ static esp_err_t parse_tcp_command(int sock, char *rx_buffer, size_t len)
             return ESP_FAIL;
         }
 
-        new_data_bits = new_data_bits - 5;
-        if (new_data_bits < UART_DATA_5_BITS || new_data_bits > UART_DATA_8_BITS) {
-            ESP_LOGE(TAG, "Invalid data bits: %u", new_data_bits);
+        // FIX: Adjust validation to avoid always-false comparison
+        // raw_data_bits is from strtoul (unsigned), so check range before subtracting
+        if (raw_data_bits < 5 || raw_data_bits > 8) {
+            ESP_LOGE(TAG, "Invalid data bits: %u", raw_data_bits);
             const char *response = "Invalid data bits\r\n";
             send(sock, response, strlen(response), 0);
             return ESP_FAIL;
         }
+        uint8_t new_data_bits = raw_data_bits - 5;
 
         // Apply UART configuration
         uart_set_baudrate(UART_NUM_0, new_baud);
@@ -450,8 +449,23 @@ static esp_err_t parse_tcp_command(int sock, char *rx_buffer, size_t len)
         current_data_bits = new_data_bits;
         save_nvs_config(new_baud, new_stop_bits, new_parity, new_data_bits, NULL, NULL, debug_mode);
         return ESP_OK;
-    } else if (strncmp(rx_buffer, "WIFI=", 5) == 0) {
-        char *ssid = rx_buffer + 5;
+    } else if (len >= 5 && memcmp(rx_buffer, "WIFI=", 5) == 0) {
+        // Similar fix for WIFI command: check for 0x00
+        if (memchr(rx_buffer, 0, len) != NULL) {
+            print_raw_data(rx_buffer, len);
+            return ESP_OK;
+        }
+
+        // Safe to make null-terminated copy
+        char *buf = (char *)malloc(len + 1);
+        if (!buf) {
+            ESP_LOGE(TAG, "Failed to allocate buf for command");
+            return ESP_FAIL;
+        }
+        memcpy(buf, rx_buffer, len);
+        buf[len] = 0;
+
+        char *ssid = buf + 5;
         char *password = strchr(ssid, ',');
         if (password) {
             *password = 0;
@@ -463,15 +477,18 @@ static esp_err_t parse_tcp_command(int sock, char *rx_buffer, size_t len)
                 ESP_LOGE(TAG, "Invalid SSID from server: %s", ssid);
                 const char *response = "Invalid SSID\r\n";
                 send(sock, response, strlen(response), 0);
+                free(buf);
                 return ESP_FAIL;
             } else if (strlen(password) > 0 && (strlen(password) < 8 || strlen(password) > 64 || !isprint((unsigned char)password[0]))) {
                 ESP_LOGE(TAG, "Invalid password from server");
                 const char *response = "Invalid password\r\n";
                 send(sock, response, strlen(response), 0);
+                free(buf);
                 return ESP_FAIL;
             } else {
                 save_nvs_config(current_baud_rate, current_stop_bits, current_parity, current_data_bits, ssid, password, debug_mode);
                 ESP_LOGI(TAG, "WiFi configuration from server successful: SSID=%s", ssid);
+                free(buf);
                 esp_restart();
                 return ESP_OK;
             }
@@ -479,17 +496,19 @@ static esp_err_t parse_tcp_command(int sock, char *rx_buffer, size_t len)
             ESP_LOGE(TAG, "Invalid WIFI command format from server");
             const char *response = "Invalid WIFI command format\r\n";
             send(sock, response, strlen(response), 0);
+            free(buf);
             return ESP_FAIL;
         }
     } else {
-        print_raw_log(rx_buffer);
+        // Not a command: transparent binary passthrough, send full len to UART
+        print_raw_data(rx_buffer, len);
         return ESP_OK;
     }
 }
 
 static void tcp_receive_task(void *pvParameters)
 {
-    char *rx_buffer = (char *) malloc(UART_BUF_SIZE);
+    uint8_t *rx_buffer = (uint8_t *) malloc(UART_BUF_SIZE);  // FIX: Changed to uint8_t* for binary
     if (!rx_buffer) {
         ESP_LOGE(TAG, "Failed to allocate memory for receive buffer");
         vTaskDelete(NULL);
@@ -522,14 +541,18 @@ static void tcp_receive_task(void *pvParameters)
             continue;
         }
 
-        rx_buffer[len] = 0;
+        // FIX: Removed rx_buffer[len] = 0; here - handle in parse if needed for commands only
 
-        // Log raw buffer content for debugging
+        // Log raw buffer content for debugging (as hex to handle binary)
         if (debug_mode) {
-            ESP_LOGI(TAG, "Raw TCP receive buffer: %s (length: %d)", rx_buffer, len);
+            char hex_buf[UART_BUF_SIZE * 3] = {0};
+            for (int i = 0; i < len; i++) {
+                snprintf(hex_buf + strlen(hex_buf), sizeof(hex_buf) - strlen(hex_buf), "%02X ", rx_buffer[i]);
+            }
+            ESP_LOGI(TAG, "Raw TCP receive buffer (hex): %s (length: %d)", hex_buf, len);
         }
 
-        // Parse and process the received command
+        // Parse and process the received data
         esp_err_t result = parse_tcp_command(tcp_sock, rx_buffer, len);
         if (result != ESP_OK) {
             ESP_LOGW(TAG, "Failed to parse TCP command");
@@ -572,7 +595,7 @@ static void uart_tcp_bridge_task(void *pvParameters)
                 }
             } else {
                 ESP_LOGE(TAG, "TCP not connected, cannot send data");
-                print_raw_log("TCP not connected\r\n");
+                // print_raw_log("TCP not connected\r\n");
             }
         }
 
@@ -774,7 +797,7 @@ void wifi_init_sta(const char *ssid, const char *password)
 
     wifi_config_t wifi_config = {
         .sta = {
-            .channel = 11,
+            .channel = 0,
             .threshold.authmode = WIFI_AUTH_WPA2_PSK
         },
     };

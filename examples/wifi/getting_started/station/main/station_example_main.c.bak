@@ -25,8 +25,8 @@
 #include <lwip/netdb.h>
 #include "driver/uart.h"
 #include "driver/gpio.h"
-#include <regex.h> // Add this at the top of the file with other includes
-
+#include <regex.h>
+#include "esp_timer.h"
 
 #define DEFAULT_ESP_WIFI_SSID      "FUNLIGHT"
 #define DEFAULT_ESP_WIFI_PASS      "funlight"
@@ -50,10 +50,7 @@ static const char *TAG = "slave";
 #define TCP_KEEPALIVE_MS 10000
 #define RESPONSE_TIMEOUT_MS 5000
 
-#define LED_PIN GPIO_NUM_4
-#define LED_BLINK_PERIOD_MS 500
-#define RSSI_LOG_INTERVAL_MS 5000
-#define LED_BLINK_DURATION_MS 200 // Duration for single blink when receiving data
+#define LED_PIN GPIO_NUM_2
 
 static uint32_t current_baud_rate = 115200;
 static uint8_t current_stop_bits = UART_STOP_BITS_1;
@@ -62,7 +59,6 @@ static uint8_t current_data_bits = UART_DATA_8_BITS;
 static bool is_tcp_connected = false;
 static int tcp_sock = -1;
 static uint8_t debug_mode = 0;
-static volatile bool led_blink_flag = false; // Flag for blinking on server data
 
 /* Initialize UART0 */
 static void uart_init(uint32_t baud_rate, uint8_t stop_bits, uint8_t parity, uint8_t data_bits)
@@ -106,54 +102,6 @@ static void led_init(void)
         ESP_LOGE(TAG, "LED GPIO config failed: %s", esp_err_to_name(err));
     }
     gpio_set_level(LED_PIN, 1); // LED off (active-low) by default
-}
-
-/* Get WiFi RSSI */
-static int8_t get_wifi_rssi(void)
-{
-    wifi_ap_record_t ap_info;
-    esp_err_t err = esp_wifi_sta_get_ap_info(&ap_info);
-    if (err == ESP_OK) {
-        return ap_info.rssi;
-    } else {
-        if (debug_mode) ESP_LOGE(TAG, "Failed to get RSSI: %s", esp_err_to_name(err));
-        return INT8_MIN;
-    }
-}
-
-/* LED control and RSSI logging task */
-static void led_task(void *pvParameters)
-{
-    while (1) {
-        if (!is_wifi_connected() || !is_tcp_connected) {
-            if (debug_mode) ESP_LOGI(TAG, "LED off: Not connected");
-            gpio_set_level(LED_PIN, 1); // LED off
-        } else if (led_blink_flag) {
-            if (debug_mode) ESP_LOGI(TAG, "LED blink: Server data received");
-            gpio_set_level(LED_PIN, 0); // LED on
-            vTaskDelay(LED_BLINK_DURATION_MS / portTICK_PERIOD_MS);
-            gpio_set_level(LED_PIN, 1); // LED off
-            led_blink_flag = false; // Reset blink flag
-        } else {
-            if (debug_mode) ESP_LOGI(TAG, "LED on: TCP connected");
-            gpio_set_level(LED_PIN, 0); // LED on
-        }
-
-        if (debug_mode && is_wifi_connected()) {
-            TickType_t current_time = xTaskGetTickCount();
-            static TickType_t last_rssi_time = 0;
-            if ((current_time - last_rssi_time) * portTICK_PERIOD_MS >= RSSI_LOG_INTERVAL_MS) {
-                int8_t rssi = get_wifi_rssi();
-                if (rssi != INT8_MIN) {
-                    ESP_LOGI(TAG, "WiFi RSSI: %d dBm", rssi);
-                }
-                last_rssi_time = current_time;
-            }
-        }
-
-        vTaskDelay(LED_BLINK_PERIOD_MS / portTICK_PERIOD_MS);
-    }
-    vTaskDelete(NULL);
 }
 
 /* Load configurations from NVS */
@@ -333,7 +281,211 @@ static esp_err_t tcp_send_data(int sock, const char *payload, size_t payload_len
     return ESP_OK;
 }
 
+/* TCP receive task */
+/* Parse and process TCP commands */
+static esp_err_t parse_tcp_command(int sock, char *rx_buffer, size_t len)
+{
+    if (!rx_buffer || len == 0) {
+        return ESP_FAIL;
+    }
 
+    // Trim buffer to first command (in case of duplicates or extra data)
+    char *cmd_end = strstr(rx_buffer, "\r\n");
+    if (cmd_end) {
+        *cmd_end = 0; // Terminate at first \r\n
+        len = cmd_end - rx_buffer;
+    }
+
+    if (strncmp(rx_buffer, "BAUD=", 5) == 0) {
+        // Regex pattern to match BAUD=<number>,STOPBIT=<number>,PARITY=<number>,DATABIT=<number> with optional \r\n
+        const char *pattern = "^BAUD=([0-9]+),STOPBIT=([0-9]+),PARITY=([0-9]+),DATABIT=([0-9]+)(\r\n)?$";
+        regex_t regex;
+        regmatch_t matches[5]; // 5 groups: whole string, BAUD, STOPBIT, PARITY, DATABIT
+        int ret = regcomp(&regex, pattern, REG_EXTENDED);
+        if (ret != 0) {
+            ESP_LOGE(TAG, "Failed to compile regex: %d", ret);
+            const char *response = "Internal error: regex compilation failed\r\n";
+            send(sock, response, strlen(response), 0);
+            return ESP_FAIL;
+        }
+
+        ret = regexec(&regex, rx_buffer, 5, matches, 0);
+        if (ret != 0) {
+            ESP_LOGE(TAG, "Invalid BAUD command format: no match for '%s'", rx_buffer);
+            const char *response = "Invalid BAUD command format\r\n";
+            send(sock, response, strlen(response), 0);
+            regfree(&regex);
+            return ESP_FAIL;
+        }
+
+        // Extract and convert each field
+        char *endptr;
+        // BAUD
+        char baud_str[32] = {0};
+        size_t baud_len = matches[1].rm_eo - matches[1].rm_so;
+        if (baud_len >= sizeof(baud_str)) {
+            ESP_LOGE(TAG, "BAUD value too long");
+            const char *response = "Invalid baud rate\r\n";
+            send(sock, response, strlen(response), 0);
+            regfree(&regex);
+            return ESP_FAIL;
+        }
+        strncpy(baud_str, rx_buffer + matches[1].rm_so, baud_len);
+        uint32_t new_baud = strtoul(baud_str, &endptr, 10);
+        if (*endptr != 0) {
+            ESP_LOGE(TAG, "Invalid BAUD value: non-numeric '%s'", baud_str);
+            const char *response = "Invalid baud rate\r\n";
+            send(sock, response, strlen(response), 0);
+            regfree(&regex);
+            return ESP_FAIL;
+        }
+
+        // STOPBIT
+        char stopbit_str[32] = {0};
+        size_t stopbit_len = matches[2].rm_eo - matches[2].rm_so;
+        if (stopbit_len >= sizeof(stopbit_str)) {
+            ESP_LOGE(TAG, "STOPBIT value too long");
+            const char *response = "Invalid stop bits\r\n";
+            send(sock, response, strlen(response), 0);
+            regfree(&regex);
+            return ESP_FAIL;
+        }
+        strncpy(stopbit_str, rx_buffer + matches[2].rm_so, stopbit_len);
+        uint8_t raw_stop_bits = strtoul(stopbit_str, &endptr, 10);
+        if (*endptr != 0) {
+            ESP_LOGE(TAG, "Invalid STOPBIT value: non-numeric '%s'", stopbit_str);
+            const char *response = "Invalid stop bits\r\n";
+            send(sock, response, strlen(response), 0);
+            regfree(&regex);
+            return ESP_FAIL;
+        }
+        uint8_t new_stop_bits = raw_stop_bits + 1;
+
+        // PARITY
+        char parity_str[32] = {0};
+        size_t parity_len = matches[3].rm_eo - matches[3].rm_so;
+        if (parity_len >= sizeof(parity_str)) {
+            ESP_LOGE(TAG, "PARITY value too long");
+            const char *response = "Invalid parity\r\n";
+            send(sock, response, strlen(response), 0);
+            regfree(&regex);
+            return ESP_FAIL;
+        }
+        strncpy(parity_str, rx_buffer + matches[3].rm_so, parity_len);
+        uint8_t new_parity = strtoul(parity_str, &endptr, 10);
+        if (*endptr != 0) {
+            ESP_LOGE(TAG, "Invalid PARITY value: non-numeric '%s'", parity_str);
+            const char *response = "Invalid parity\r\n";
+            send(sock, response, strlen(response), 0);
+            regfree(&regex);
+            return ESP_FAIL;
+        }
+        if (new_parity == 1) new_parity = 3;
+
+        // DATABIT
+        char databit_str[32] = {0};
+        size_t databit_len = matches[4].rm_eo - matches[4].rm_so;
+        if (databit_len >= sizeof(databit_str)) {
+            ESP_LOGE(TAG, "DATABIT value too long");
+            const char *response = "Invalid data bits\r\n";
+            send(sock, response, strlen(response), 0);
+            regfree(&regex);
+            return ESP_FAIL;
+        }
+        strncpy(databit_str, rx_buffer + matches[4].rm_so, databit_len);
+        uint8_t new_data_bits = strtoul(databit_str, &endptr, 10);
+        if (*endptr != 0) {
+            ESP_LOGE(TAG, "Invalid DATABIT value: non-numeric '%s'", databit_str);
+            const char *response = "Invalid data bits\r\n";
+            send(sock, response, strlen(response), 0);
+            regfree(&regex);
+            return ESP_FAIL;
+        }
+
+        regfree(&regex);
+
+        // ESP_LOGI(TAG, "Received server UART config: BAUD=%u, STOPBIT=%u (raw=%u), PARITY=%u, DATABIT=%u",
+        //          new_baud, new_stop_bits, raw_stop_bits, new_parity, new_data_bits);
+
+        // Validate parameters
+        if (new_baud < 110 || new_baud > 2000000) {
+            ESP_LOGE(TAG, "Invalid baud rate: %u", new_baud);
+            const char *response = "Invalid baud rate\r\n";
+            send(sock, response, strlen(response), 0);
+            return ESP_FAIL;
+        }
+
+        if (new_stop_bits != UART_STOP_BITS_1 && new_stop_bits != UART_STOP_BITS_2) {
+            ESP_LOGE(TAG, "Invalid stop bits: %u (raw value: %u)", new_stop_bits, raw_stop_bits);
+            const char *response = "Invalid stop bits\r\n";
+            send(sock, response, strlen(response), 0);
+            return ESP_FAIL;
+        }
+
+        if (new_parity != UART_PARITY_DISABLE && new_parity != UART_PARITY_ODD && new_parity != UART_PARITY_EVEN) {
+            ESP_LOGE(TAG, "Invalid parity: %u", new_parity);
+            const char *response = "Invalid parity\r\n";
+            send(sock, response, strlen(response), 0);
+            return ESP_FAIL;
+        }
+
+        new_data_bits = new_data_bits - 5;
+        if (new_data_bits < UART_DATA_5_BITS || new_data_bits > UART_DATA_8_BITS) {
+            ESP_LOGE(TAG, "Invalid data bits: %u", new_data_bits);
+            const char *response = "Invalid data bits\r\n";
+            send(sock, response, strlen(response), 0);
+            return ESP_FAIL;
+        }
+
+        // Apply UART configuration
+        uart_set_baudrate(UART_NUM_0, new_baud);
+        uart_set_stop_bits(UART_NUM_0, new_stop_bits);
+        uart_set_parity(UART_NUM_0, new_parity);
+        uart_set_word_length(UART_NUM_0, new_data_bits);
+
+        // Update global variables and save to NVS
+        current_baud_rate = new_baud;
+        current_stop_bits = new_stop_bits;
+        current_parity = new_parity;
+        current_data_bits = new_data_bits;
+        save_nvs_config(new_baud, new_stop_bits, new_parity, new_data_bits, NULL, NULL, debug_mode);
+        return ESP_OK;
+    } else if (strncmp(rx_buffer, "WIFI=", 5) == 0) {
+        char *ssid = rx_buffer + 5;
+        char *password = strchr(ssid, ',');
+        if (password) {
+            *password = 0;
+            password++;
+            char *end = strchr(password, '\r');
+            if (end) *end = 0;
+
+            if (strlen(ssid) == 0 || strlen(ssid) > 32 || !isprint((unsigned char)ssid[0])) {
+                ESP_LOGE(TAG, "Invalid SSID from server: %s", ssid);
+                const char *response = "Invalid SSID\r\n";
+                send(sock, response, strlen(response), 0);
+                return ESP_FAIL;
+            } else if (strlen(password) > 0 && (strlen(password) < 8 || strlen(password) > 64 || !isprint((unsigned char)password[0]))) {
+                ESP_LOGE(TAG, "Invalid password from server");
+                const char *response = "Invalid password\r\n";
+                send(sock, response, strlen(response), 0);
+                return ESP_FAIL;
+            } else {
+                save_nvs_config(current_baud_rate, current_stop_bits, current_parity, current_data_bits, ssid, password, debug_mode);
+                ESP_LOGI(TAG, "WiFi configuration from server successful: SSID=%s", ssid);
+                esp_restart();
+                return ESP_OK;
+            }
+        } else {
+            ESP_LOGE(TAG, "Invalid WIFI command format from server");
+            const char *response = "Invalid WIFI command format\r\n";
+            send(sock, response, strlen(response), 0);
+            return ESP_FAIL;
+        }
+    } else {
+        print_raw_log(rx_buffer);
+        return ESP_OK;
+    }
+}
 
 static void tcp_receive_task(void *pvParameters)
 {
@@ -355,14 +507,14 @@ static void tcp_receive_task(void *pvParameters)
                 vTaskDelay(10 / portTICK_PERIOD_MS);
                 continue;
             }
-            ESP_LOGW(TAG, "Receive failed: errno %d, reconnecting...", errno);
+            // ESP_LOGW(TAG, "Receive failed: errno %d, reconnecting...", errno);
             is_tcp_connected = false;
             close(tcp_sock);
             tcp_sock = -1;
             vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
             continue;
         } else if (len == 0) {
-            ESP_LOGI(TAG, "Connection closed by server");
+            // ESP_LOGI(TAG, "Connection closed by server");
             is_tcp_connected = false;
             close(tcp_sock);
             tcp_sock = -1;
@@ -372,193 +524,15 @@ static void tcp_receive_task(void *pvParameters)
 
         rx_buffer[len] = 0;
 
-        if (strncmp(rx_buffer, "BAUD=", 5) == 0) {
-            ESP_LOGI(TAG, "%s", rx_buffer);
+        // Log raw buffer content for debugging
+        if (debug_mode) {
+            ESP_LOGI(TAG, "Raw TCP receive buffer: %s (length: %d)", rx_buffer, len);
+        }
 
-            // Regex pattern to match BAUD=<number>,STOPBIT=<number>,PARITY=<number>,DATABIT=<number>\r\n
-            const char *pattern = "^BAUD=([0-9]+),STOPBIT=([0-9]+),PARITY=([0-9]+),DATABIT=([0-9]+)\r\n$";
-            regex_t regex;
-            regmatch_t matches[5]; // 5 groups: whole string, BAUD, STOPBIT, PARITY, DATABIT
-            int ret = regcomp(&regex, pattern, REG_EXTENDED);
-            if (ret != 0) {
-                ESP_LOGE(TAG, "Failed to compile regex: %d", ret);
-                const char *response = "Internal error: regex compilation failed\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-                continue;
-            }
-
-            ret = regexec(&regex, rx_buffer, 5, matches, 0);
-            if (ret != 0) {
-                ESP_LOGE(TAG, "Invalid BAUD command format: no match for '%s'", rx_buffer);
-                const char *response = "Invalid BAUD command format\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-                regfree(&regex);
-                continue;
-            }
-
-            // Extract and convert each field
-            char *endptr;
-            // BAUD
-            char baud_str[32] = {0};
-            size_t baud_len = matches[1].rm_eo - matches[1].rm_so;
-            if (baud_len >= sizeof(baud_str)) {
-                ESP_LOGE(TAG, "BAUD value too long");
-                const char *response = "Invalid baud rate\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-                regfree(&regex);
-                continue;
-            }
-            strncpy(baud_str, rx_buffer + matches[1].rm_so, baud_len);
-            uint32_t new_baud = strtoul(baud_str, &endptr, 10);
-            if (*endptr != 0) {
-                ESP_LOGE(TAG, "Invalid BAUD value: non-numeric '%s'", baud_str);
-                const char *response = "Invalid baud rate\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-                regfree(&regex);
-                continue;
-            }
-
-            // STOPBIT
-            char stopbit_str[32] = {0};
-            size_t stopbit_len = matches[2].rm_eo - matches[2].rm_so;
-            if (stopbit_len >= sizeof(stopbit_str)) {
-                ESP_LOGE(TAG, "STOPBIT value too long");
-                const char *response = "Invalid stop bits\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-                regfree(&regex);
-                continue;
-            }
-            strncpy(stopbit_str, rx_buffer + matches[2].rm_so, stopbit_len);
-            uint8_t raw_stop_bits = strtoul(stopbit_str, &endptr, 10);
-            if (*endptr != 0) {
-                ESP_LOGE(TAG, "Invalid STOPBIT value: non-numeric '%s'", stopbit_str);
-                const char *response = "Invalid stop bits\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-                regfree(&regex);
-                continue;
-            }
-            uint8_t new_stop_bits = raw_stop_bits + 1;
-
-            // PARITY
-            char parity_str[32] = {0};
-            size_t parity_len = matches[3].rm_eo - matches[3].rm_so;
-            if (parity_len >= sizeof(parity_str)) {
-                ESP_LOGE(TAG, "PARITY value too long");
-                const char *response = "Invalid parity\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-                regfree(&regex);
-                continue;
-            }
-            strncpy(parity_str, rx_buffer + matches[3].rm_so, parity_len);
-            uint8_t new_parity = strtoul(parity_str, &endptr, 10);
-            if (*endptr != 0) {
-                ESP_LOGE(TAG, "Invalid PARITY value: non-numeric '%s'", parity_str);
-                const char *response = "Invalid parity\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-                regfree(&regex);
-                continue;
-            }
-            if (new_parity == 1) new_parity = 3;
-
-            // DATABIT
-            char databit_str[32] = {0};
-            size_t databit_len = matches[4].rm_eo - matches[4].rm_so;
-            if (databit_len >= sizeof(databit_str)) {
-                ESP_LOGE(TAG, "DATABIT value too long");
-                const char *response = "Invalid data bits\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-                regfree(&regex);
-                continue;
-            }
-            strncpy(databit_str, rx_buffer + matches[4].rm_so, databit_len);
-            uint8_t new_data_bits = strtoul(databit_str, &endptr, 10);
-            if (*endptr != 0) {
-                ESP_LOGE(TAG, "Invalid DATABIT value: non-numeric '%s'", databit_str);
-                const char *response = "Invalid data bits\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-                regfree(&regex);
-                continue;
-            }
-
-            regfree(&regex);
-
-            ESP_LOGI(TAG, "Received server UART config: BAUD=%u, STOPBIT=%u (raw=%u), PARITY=%u, DATABIT=%u",
-                     new_baud, new_stop_bits, raw_stop_bits, new_parity, new_data_bits);
-
-            // Validate parameters
-            if (new_baud < 110 || new_baud > 2000000) {
-                ESP_LOGE(TAG, "Invalid baud rate: %u", new_baud);
-                const char *response = "Invalid baud rate\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-                continue;
-            }
-
-            uart_set_baudrate(UART_NUM_0, new_baud);
-
-            if (new_stop_bits != UART_STOP_BITS_1 && new_stop_bits != UART_STOP_BITS_2) {
-                ESP_LOGE(TAG, "Invalid stop bits: %u (raw value: %u)", new_stop_bits, raw_stop_bits);
-                const char *response = "Invalid stop bits\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-                continue;
-            }
-
-            uart_set_stop_bits(UART_NUM_0, new_stop_bits);
-            if (new_parity != UART_PARITY_DISABLE && new_parity != UART_PARITY_ODD && new_parity != UART_PARITY_EVEN) {
-                ESP_LOGE(TAG, "Invalid parity: %u", new_parity);
-                const char *response = "Invalid parity\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-                continue;
-            }
-            uart_set_parity(UART_NUM_0, new_parity);
-            new_data_bits = new_data_bits - 5;
-            if (new_data_bits < UART_DATA_5_BITS || new_data_bits > UART_DATA_8_BITS) {
-                ESP_LOGE(TAG, "Invalid data bits: %u", new_data_bits);
-                const char *response = "Invalid data bits\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-                continue;
-            }
-            uart_set_word_length(UART_NUM_0, new_data_bits);
-
-            current_baud_rate = new_baud;
-            current_stop_bits = new_stop_bits;
-            current_parity = new_parity;
-            current_data_bits = new_data_bits;
-            save_nvs_config(new_baud, new_stop_bits, new_parity, new_data_bits, NULL, NULL, debug_mode);
-            // const char *response = "OK\r\n";
-            // send(tcp_sock, response, strlen(response), 0);
-            // ESP_LOGI(TAG, "UART config updated: BAUD=%u, STOPBIT=%u, PARITY=%u, DATABIT=%u",
-            //          new_baud, new_stop_bits, new_parity, new_data_bits);
-        } else if (strncmp(rx_buffer, "WIFI=", 5) == 0) {
-            char *ssid = rx_buffer + 5;
-            char *password = strchr(ssid, ',');
-            if (password) {
-                *password = 0;
-                password++;
-                char *end = strchr(password, '\r');
-                if (end) *end = 0;
-                if (strlen(ssid) == 0 || strlen(ssid) > 32 || !isprint((unsigned char)ssid[0])) {
-                    ESP_LOGE(TAG, "Invalid SSID from server: %s", ssid);
-                    const char *response = "Invalid SSID\r\n";
-                    send(tcp_sock, response, strlen(response), 0);
-                } else if (strlen(password) > 0 && (strlen(password) < 8 || strlen(password) > 64 || !isprint((unsigned char)password[0]))) {
-                    ESP_LOGE(TAG, "Invalid password from server");
-                    const char *response = "Invalid password\r\n";
-                    send(tcp_sock, response, strlen(response), 0);
-                } else {
-                    save_nvs_config(current_baud_rate, current_stop_bits, current_parity, current_data_bits, ssid, password, debug_mode);
-                    ESP_LOGI(TAG, "WiFi configuration from server successful: SSID=%s", ssid);
-                    const char *response = "OK\r\n";
-                    send(tcp_sock, response, strlen(response), 0);
-                    esp_restart();
-                }
-            } else {
-                ESP_LOGE(TAG, "Invalid WIFI command format from server");
-                const char *response = "Invalid WIFI command format\r\n";
-                send(tcp_sock, response, strlen(response), 0);
-            }
-        } else {
-            led_blink_flag = true; // Set blink flag for server data
-            print_raw_log(rx_buffer);
+        // Parse and process the received command
+        esp_err_t result = parse_tcp_command(tcp_sock, rx_buffer, len);
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to parse TCP command");
         }
 
         vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -650,7 +624,7 @@ static void uart_tcp_bridge_task(void *pvParameters)
                 vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
                 continue;
             }
-            ESP_LOGI(TAG, "Successfully connected to %s:%d", HOST_IP_ADDR, PORT);
+            // ESP_LOGI(TAG, "Successfully connected to %s:%d", HOST_IP_ADDR, PORT);
             is_tcp_connected = true;
         }
 
@@ -667,11 +641,9 @@ static void uart_tcp_bridge_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-/* Task to reset boot count after 10 seconds uptime */
-static void boot_count_reset_task(void *pvParameters)
+/* Timer callback to reset boot count */
+static void boot_count_reset_timer_callback(void *arg)
 {
-    vTaskDelay(BOOT_COUNT_RESET_DELAY_MS / portTICK_PERIOD_MS);
-
     nvs_handle_t nvs_handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
     if (err == ESP_OK) {
@@ -690,14 +662,11 @@ static void boot_count_reset_task(void *pvParameters)
     } else {
         ESP_LOGE(TAG, "Failed to open NVS for boot count reset: %s", esp_err_to_name(err));
     }
-
-    vTaskDelete(NULL);
 }
 
 /* Handle boot count increment and check for factory reset */
 static void handle_boot_count(void)
 {
-    ESP_LOGI(TAG, "Set Boot count handle_boot_count");
     nvs_handle_t nvs_handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK) {
@@ -708,7 +677,6 @@ static void handle_boot_count(void)
     uint32_t boot_count = 0;
     err = nvs_get_u32(nvs_handle, BOOT_COUNT_KEY, &boot_count);
     if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGE(TAG, "Failed to read boot count: %s", esp_err_to_name(err));
         nvs_close(nvs_handle);
         return;
     }
@@ -720,16 +688,12 @@ static void handle_boot_count(void)
         nvs_close(nvs_handle);
         return;
     }
-
-    ESP_LOGI(TAG, "Read Boot count: %u", boot_count);
     err = nvs_commit(nvs_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to commit boot count: %s", esp_err_to_name(err));
         nvs_close(nvs_handle);
         return;
     }
-
-    ESP_LOGI(TAG, "Set Boot count: %u", boot_count);
 
     if (boot_count > BOOT_COUNT_THRESHOLD) {
         ESP_LOGW(TAG, "Boot count %u exceeds threshold %d, resetting to factory defaults", 
@@ -741,6 +705,23 @@ static void handle_boot_count(void)
     }
 
     nvs_close(nvs_handle);
+
+    // Start one-shot timer for boot count reset
+    esp_timer_handle_t boot_count_timer;
+    const esp_timer_create_args_t timer_args = {
+        .callback = &boot_count_reset_timer_callback,
+        .name = "boot_count_reset"
+    };
+    err = esp_timer_create(&timer_args, &boot_count_timer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create boot count reset timer: %s", esp_err_to_name(err));
+        return;
+    }
+    err = esp_timer_start_once(boot_count_timer, BOOT_COUNT_RESET_DELAY_MS * 1000);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start boot count reset timer: %s", esp_err_to_name(err));
+        esp_timer_delete(boot_count_timer);
+    }
 }
 
 static int s_retry_num = 0;
@@ -752,19 +733,20 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
             esp_wifi_connect();
             break;
         case SYSTEM_EVENT_STA_GOT_IP:
-            ESP_LOGI(TAG, "got ip:%s", ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
+            // ESP_LOGI(TAG, "got ip:%s", ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
             s_retry_num = 0;
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            gpio_set_level(LED_PIN, 0); // LED on (active-low)
             break;
         case SYSTEM_EVENT_STA_DISCONNECTED:
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            ESP_LOGI(TAG, "Disconnected from AP, retrying...");
+            gpio_set_level(LED_PIN, 1); // LED off (active-low)
             esp_wifi_connect();
             s_retry_num++;
             if (s_retry_num >= EXAMPLE_ESP_MAXIMUM_RETRY) {
-                ESP_LOGW(TAG, "Max WiFi retries reached, continuing to retry...");
+                // ESP_LOGW(TAG, "Max WiFi retries reached, continuing to retry...");
             }
             break;
         default:
@@ -848,12 +830,9 @@ void app_main(void)
     }
 
     handle_boot_count();
-    xTaskCreate(boot_count_reset_task, "boot_count_reset", 2048, NULL, 4, NULL);
-
     led_init();
     wifi_init_sta(ssid, password);
     uart_init(current_baud_rate, current_stop_bits, current_parity, current_data_bits);
     xTaskCreate(uart_tcp_bridge_task, "uart_tcp_bridge", 4096, NULL, 5, NULL);
     xTaskCreate(tcp_receive_task, "tcp_receive", 4096, NULL, 5, NULL);
-    xTaskCreate(led_task, "led_task", 2048, NULL, 4, NULL);
 }
