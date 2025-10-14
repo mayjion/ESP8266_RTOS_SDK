@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <fcntl.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -27,6 +28,7 @@
 #include "driver/gpio.h"
 #include <regex.h>
 #include "esp_timer.h"
+#include "esp_task_wdt.h"  // TWDT 支持
 
 #define DEFAULT_ESP_WIFI_SSID      "FUNLIGHT"
 #define DEFAULT_ESP_WIFI_PASS      "funlight"
@@ -74,7 +76,8 @@ static void uart_init(uint32_t baud_rate, uint8_t stop_bits, uint8_t parity, uin
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "UART param config failed: %s", esp_err_to_name(err));
     }
-    err = uart_driver_install(UART_NUM_0, UART_BUF_SIZE * 2, 0, 0, NULL, 0);
+    // 增大 TX buffer 到 2048，避免 queue 满阻塞
+    err = uart_driver_install(UART_NUM_0, UART_BUF_SIZE * 2, UART_BUF_SIZE * 4, 0, NULL, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(err));
     }
@@ -192,7 +195,6 @@ static void save_nvs_config(uint32_t baud_rate, uint8_t stop_bits, uint8_t parit
 }
 
 /* Print raw data (binary-safe) to UART0 */
-// FIX: Renamed and modified to handle binary data with explicit length, avoiding strlen which stops at 0x00.
 static SemaphoreHandle_t raw_log_mutex = NULL;
 
 static void raw_log_init(void)
@@ -209,21 +211,31 @@ static void print_raw_data(const uint8_t *data, size_t len)
 {
     if (!data || len == 0) return;
 
+    // 喂 TWDT 前
+    esp_task_wdt_reset();
+
     static bool initialized = false;
     if (!initialized) {
         raw_log_init();
         initialized = true;
     }
 
-    if (raw_log_mutex && xSemaphoreTake(raw_log_mutex, portMAX_DELAY) == pdTRUE) {
-        uart_write_bytes(UART_NUM_0, (const char *)data, len); // FIX: Cast to const char *
-        uart_wait_tx_done(UART_NUM_0, 100 / portTICK_PERIOD_MS);
+    if (raw_log_mutex && xSemaphoreTake(raw_log_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        int written = uart_write_bytes(UART_NUM_0, (const char *)data, len);
+        if (written != len) {
+            ESP_LOGW(TAG, "UART write incomplete: %d/%zu bytes", written, len);
+        }
+        // 移除 uart_wait_tx_done()：避免阻塞，允许异步 TX
         xSemaphoreGive(raw_log_mutex);
     } else {
-        uart_write_bytes(UART_NUM_0, (const char *)data, len); // FIX: Cast to const char *
-        uart_wait_tx_done(UART_NUM_0, 100 / portTICK_PERIOD_MS);
+        uart_write_bytes(UART_NUM_0, (const char *)data, len);
+        // 移除 uart_wait_tx_done()
     }
+
+    // 喂 TWDT 后
+    esp_task_wdt_reset();
 }
+
 /* TCP send data with optional response expectation */
 static esp_err_t tcp_send_data(int sock, const char *payload, size_t payload_len, char *rx_buffer, size_t rx_buffer_size, bool expect_response)
 {
@@ -252,7 +264,6 @@ static esp_err_t tcp_send_data(int sock, const char *payload, size_t payload_len
         return ESP_FAIL;
     }
 
-    // FIX: Use print_raw_data with length for binary safety
     print_raw_data((uint8_t *)rx_buffer, len);
     return ESP_OK;
 }
@@ -261,6 +272,13 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
 {
     if (!rx_buffer || len == 0) {
         return ESP_FAIL;
+    }
+
+    // 快速路径：如果含 \r\n，假设命令；否则 passthrough
+    bool is_likely_command = (memchr(rx_buffer, '\r', len) != NULL || memchr(rx_buffer, '\n', len) != NULL);
+    if (!is_likely_command) {
+        print_raw_data(rx_buffer, len);
+        return ESP_OK;
     }
 
     // Check if potential BAUD command
@@ -426,7 +444,6 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
             return ESP_FAIL;
         }
 
-        // FIX: Adjust validation to avoid always-false comparison
         // raw_data_bits is from strtoul (unsigned), so check range before subtracting
         if (raw_data_bits < 5 || raw_data_bits > 8) {
             ESP_LOGE(TAG, "Invalid data bits: %u", raw_data_bits);
@@ -516,49 +533,57 @@ static void tcp_receive_task(void *pvParameters)
 
     while (1) {
         if (!is_tcp_connected || tcp_sock == -1) {
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            vTaskDelay(500 / portTICK_PERIOD_MS);  // 延长无连接 delay，避免 CPU 空转
+            esp_task_wdt_reset();  // 喂狗
             continue;
         }
 
         int len = recv(tcp_sock, rx_buffer, UART_BUF_SIZE - 1, 0);
         if (len < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                vTaskDelay(10 / portTICK_PERIOD_MS);
+                vTaskDelay(5 / portTICK_PERIOD_MS);  // 缩短到 5ms，更及时 poll
+                esp_task_wdt_reset();
                 continue;
             }
-            // ESP_LOGW(TAG, "Receive failed: errno %d, reconnecting...", errno);
+            ESP_LOGW(TAG, "Receive failed: errno %d, reconnecting...", errno);  // 启用警告日志
             is_tcp_connected = false;
             close(tcp_sock);
             tcp_sock = -1;
             vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
+            esp_task_wdt_reset();
             continue;
         } else if (len == 0) {
-            // ESP_LOGI(TAG, "Connection closed by server");
+            ESP_LOGI(TAG, "Connection closed by server, reconnecting...");
             is_tcp_connected = false;
             close(tcp_sock);
             tcp_sock = -1;
             vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
+            esp_task_wdt_reset();
             continue;
         }
 
-        // FIX: Removed rx_buffer[len] = 0; here - handle in parse if needed for commands only
-
-        // Log raw buffer content for debugging (as hex to handle binary)
+        // 优化 debug hex log：len > 200 时仅摘要，避免慢循环
         if (debug_mode) {
-            char hex_buf[UART_BUF_SIZE * 3] = {0};
-            for (int i = 0; i < len; i++) {
-                snprintf(hex_buf + strlen(hex_buf), sizeof(hex_buf) - strlen(hex_buf), "%02X ", rx_buffer[i]);
+            if (len <= 200) {
+                char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};  // +1 for null
+                char *ptr = hex_buf;
+                for (int i = 0; i < len; i++) {
+                    ptr += sprintf(ptr, "%02X ", rx_buffer[i]);  // sprintf 直接追加，无 strlen
+                }
+                ESP_LOGI(TAG, "Raw TCP receive buffer (hex): %s (length: %d)", hex_buf, len);
+            } else {
+                ESP_LOGI(TAG, "Large TCP packet received: %d bytes (hex log skipped)", len);
             }
-            ESP_LOGI(TAG, "Raw TCP receive buffer (hex): %s (length: %d)", hex_buf, len);
         }
 
         // Parse and process the received data
         esp_err_t result = parse_tcp_command(tcp_sock, rx_buffer, len);
         if (result != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to parse TCP command");
+            ESP_LOGW(TAG, "Failed to parse TCP command (len=%d)", len);
         }
 
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        vTaskDelay(1 / portTICK_PERIOD_MS);  // 缩短到 1ms，提高 yield 频率
+        esp_task_wdt_reset();  // 每循环喂狗
     }
 
     free(rx_buffer);
@@ -607,6 +632,7 @@ static void uart_tcp_bridge_task(void *pvParameters)
                 is_tcp_connected = false;
             }
             vTaskDelay(1000 / portTICK_PERIOD_MS);
+            esp_task_wdt_reset();
             continue;
         }
 
@@ -620,6 +646,7 @@ static void uart_tcp_bridge_task(void *pvParameters)
             if (tcp_sock < 0) {
                 ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
                 vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
+                esp_task_wdt_reset();
                 continue;
             }
 
@@ -645,13 +672,37 @@ static void uart_tcp_bridge_task(void *pvParameters)
                 tcp_sock = -1;
                 is_tcp_connected = false;
                 vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
+                esp_task_wdt_reset();
                 continue;
             }
+
+            // 新增：设为非阻塞
+            int flags = fcntl(tcp_sock, F_GETFL, 0);
+            if (flags < 0) {
+                ESP_LOGE(TAG, "fcntl F_GETFL failed: errno %d", errno);
+                close(tcp_sock);
+                tcp_sock = -1;
+                is_tcp_connected = false;
+                vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
+                esp_task_wdt_reset();
+                continue;
+            }
+            if (fcntl(tcp_sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+                ESP_LOGE(TAG, "fcntl F_SETFL O_NONBLOCK failed: errno %d", errno);
+                close(tcp_sock);
+                tcp_sock = -1;
+                is_tcp_connected = false;
+                vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
+                esp_task_wdt_reset();
+                continue;
+            }
+
             // ESP_LOGI(TAG, "Successfully connected to %s:%d", HOST_IP_ADDR, PORT);
             is_tcp_connected = true;
         }
 
         vTaskDelay(10 / portTICK_PERIOD_MS);
+        esp_task_wdt_reset();  // 每循环喂狗
     }
 
     if (tcp_sock != -1) {
@@ -838,6 +889,9 @@ void app_main(void)
         }
     }
 
+    // 初始化 TWDT：ESP8266 无参数版本
+    esp_task_wdt_init();
+
     char ssid[32] = {0};
     char password[64] = {0};
     err = load_nvs_config(&current_baud_rate, &current_stop_bits, &current_parity, &current_data_bits, ssid, sizeof(ssid), password, sizeof(password), &debug_mode);
@@ -856,6 +910,6 @@ void app_main(void)
     led_init();
     wifi_init_sta(ssid, password);
     uart_init(current_baud_rate, current_stop_bits, current_parity, current_data_bits);
-    xTaskCreate(uart_tcp_bridge_task, "uart_tcp_bridge", 4096, NULL, 5, NULL);
-    xTaskCreate(tcp_receive_task, "tcp_receive", 4096, NULL, 5, NULL);
+    xTaskCreate(uart_tcp_bridge_task, "uart_tcp_bridge", 6144, NULL, 8, NULL);
+    xTaskCreate(tcp_receive_task, "tcp_receive", 6144, NULL, 8, NULL);
 }
