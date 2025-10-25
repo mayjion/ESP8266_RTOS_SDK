@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -28,7 +29,7 @@
 #include "driver/gpio.h"
 #include <regex.h>
 #include "esp_timer.h"
-#include "esp_task_wdt.h"  // TWDT Ö§³Ö
+#include "esp_task_wdt.h"  // TWDT æ”¯æŒ
 
 #define DEFAULT_ESP_WIFI_SSID      "FUNLIGHT"
 #define DEFAULT_ESP_WIFI_PASS      "funlight"
@@ -45,6 +46,7 @@ static EventGroupHandle_t s_wifi_event_group;
 static const char *TAG = "slave";
 
 #define PORT 12345
+#define UDP_PORT PORT
 #define CONFIG_EXAMPLE_IPV4 1
 #define UART_BUF_SIZE (512)
 #define TCP_RETRY_DELAY_MS 2000
@@ -60,7 +62,141 @@ static uint8_t current_parity = UART_PARITY_DISABLE;
 static uint8_t current_data_bits = UART_DATA_8_BITS;
 static bool is_tcp_connected = false;
 static int tcp_sock = -1;
+static int udp_sock = -1;
 static uint8_t debug_mode = 0;
+static struct sockaddr_in server_addr;
+
+typedef enum {
+    LED_SLOW_BLINK,
+    LED_FAST_BLINK,
+    LED_SOLID_ON
+} led_state_t;
+
+static volatile led_state_t current_led_state = LED_SLOW_BLINK;  // FIX: Added volatile for multi-task safety
+
+/* CRC32 computation for ESP8266 */
+static uint32_t compute_crc32(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFF;
+    const uint32_t poly = 0xEDB88320;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 1) {
+                crc = (crc >> 1) ^ poly;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
+/* Author code verification */
+static void authorcodeverify(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for auth: %s", esp_err_to_name(err));
+        while (1) {
+            gpio_set_level(LED_PIN, 0); // on (active-low)
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            gpio_set_level(LED_PIN, 1); // off
+            vTaskDelay(pdMS_TO_TICKS(3000));
+        }
+    }
+
+    uint8_t mac[6];
+    err = esp_wifi_get_mac(ESP_IF_WIFI_STA, mac);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get MAC: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        while (1) {
+            gpio_set_level(LED_PIN, 0); // on
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            gpio_set_level(LED_PIN, 1); // off
+            vTaskDelay(pdMS_TO_TICKS(3000));
+        }
+    }
+
+    uint32_t computed_code = compute_crc32(mac, 6);
+
+    uint32_t stored_code = 0;
+    err = nvs_get_u32(nvs_handle, "auth_code", &stored_code);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        // First time, write the code
+        err = nvs_set_u32(nvs_handle, "auth_code", computed_code);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to write auth_code: %s", esp_err_to_name(err));
+            nvs_close(nvs_handle);
+            while (1) {
+                gpio_set_level(LED_PIN, 0); // on
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                gpio_set_level(LED_PIN, 1); // off
+                vTaskDelay(pdMS_TO_TICKS(3000));
+            }
+        }
+        err = nvs_commit(nvs_handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to commit auth_code: %s", esp_err_to_name(err));
+        }
+        ESP_LOGI(TAG, "Auth code written successfully");
+        nvs_close(nvs_handle);
+        return;
+    } else if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read auth_code: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        while (1) {
+            gpio_set_level(LED_PIN, 0); // on
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            gpio_set_level(LED_PIN, 1); // off
+            vTaskDelay(pdMS_TO_TICKS(3000));
+        }
+    }
+
+    // Verify
+    if (computed_code != stored_code) {
+        ESP_LOGE(TAG, "Auth verification failed. Computed: 0x%08x, Stored: 0x%08x", computed_code, stored_code);
+        nvs_close(nvs_handle);
+        while (1) {
+            gpio_set_level(LED_PIN, 0); // on
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            gpio_set_level(LED_PIN, 1); // off
+            vTaskDelay(pdMS_TO_TICKS(3000));
+        }
+    }
+
+    ESP_LOGI(TAG, "Auth verification passed");
+    nvs_close(nvs_handle);
+}
+
+/* Custom putchar for UART1 */
+static int uart1_putchar(char c)
+{
+    uart_write_bytes(UART_NUM_1, (const char *)&c, 1);
+    return 1;
+}
+
+/* Initialize UART1 for logging */
+static void uart1_init(void)
+{
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    esp_err_t err = uart_param_config(UART_NUM_1, &uart_config);
+    if (err != ESP_OK) {
+        // Fallback, but continue
+    }
+    err = uart_driver_install(UART_NUM_1, 256, 0, 0, NULL, 0);
+    if (err != ESP_OK) {
+        // Fallback, but continue
+    }
+}
 
 /* Initialize UART0 */
 static void uart_init(uint32_t baud_rate, uint8_t stop_bits, uint8_t parity, uint8_t data_bits)
@@ -76,7 +212,7 @@ static void uart_init(uint32_t baud_rate, uint8_t stop_bits, uint8_t parity, uin
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "UART param config failed: %s", esp_err_to_name(err));
     }
-    // Ôö´ó TX buffer µ½ 2048£¬±ÜÃâ queue Âú×èÈû
+    // å¢å¤§ TX buffer åˆ° 2048ï¼Œé¿å… queue æ»¡é˜»å¡
     err = uart_driver_install(UART_NUM_0, UART_BUF_SIZE * 2, UART_BUF_SIZE * 4, 0, NULL, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(err));
@@ -105,6 +241,33 @@ static void led_init(void)
         ESP_LOGE(TAG, "LED GPIO config failed: %s", esp_err_to_name(err));
     }
     gpio_set_level(LED_PIN, 1); // LED off (active-low) by default
+}
+
+/* LED control task */
+static void led_task(void *pvParameters)
+{
+    while (1) {
+        switch (current_led_state) {
+            case LED_SLOW_BLINK:
+                gpio_set_level(LED_PIN, 0); // on
+                vTaskDelay(500 / portTICK_PERIOD_MS);
+                gpio_set_level(LED_PIN, 1); // off
+                vTaskDelay(1500 / portTICK_PERIOD_MS);
+                break;
+            case LED_FAST_BLINK:
+                gpio_set_level(LED_PIN, 0); // on
+                vTaskDelay(200 / portTICK_PERIOD_MS);
+                gpio_set_level(LED_PIN, 1); // off
+                vTaskDelay(300 / portTICK_PERIOD_MS);
+                break;
+            case LED_SOLID_ON:
+                gpio_set_level(LED_PIN, 0); // on
+                vTaskDelay(100 / portTICK_PERIOD_MS); // FIX: Reduced to 100ms for faster state checks without high CPU
+                break;
+        }
+        esp_task_wdt_reset();
+    }
+    vTaskDelete(NULL);
 }
 
 /* Load configurations from NVS */
@@ -211,7 +374,7 @@ static void print_raw_data(const uint8_t *data, size_t len)
 {
     if (!data || len == 0) return;
 
-    // Î¹ TWDT Ç°
+    // å–‚ TWDT å‰
     esp_task_wdt_reset();
 
     static bool initialized = false;
@@ -225,14 +388,14 @@ static void print_raw_data(const uint8_t *data, size_t len)
         if (written != len) {
             ESP_LOGW(TAG, "UART write incomplete: %d/%zu bytes", written, len);
         }
-        // ÒÆ³ı uart_wait_tx_done()£º±ÜÃâ×èÈû£¬ÔÊĞíÒì²½ TX
+        // ç§»é™¤ uart_wait_tx_done()ï¼šé¿å…é˜»å¡ï¼Œå…è®¸å¼‚æ­¥ TX
         xSemaphoreGive(raw_log_mutex);
     } else {
         uart_write_bytes(UART_NUM_0, (const char *)data, len);
-        // ÒÆ³ı uart_wait_tx_done()
+        // ç§»é™¤ uart_wait_tx_done()
     }
 
-    // Î¹ TWDT ºó
+    // å–‚ TWDT å
     esp_task_wdt_reset();
 }
 
@@ -268,13 +431,13 @@ static esp_err_t tcp_send_data(int sock, const char *payload, size_t payload_len
     return ESP_OK;
 }
 
-static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t len)
+static esp_err_t parse_command(int sock, const uint8_t *rx_buffer, size_t len, bool is_tcp)
 {
     if (!rx_buffer || len == 0) {
         return ESP_FAIL;
     }
 
-    // ¿ìËÙÂ·¾¶£ºÈç¹ûº¬ \r\n£¬¼ÙÉèÃüÁî£»·ñÔò passthrough
+    // å¿«é€Ÿè·¯å¾„ï¼šå¦‚æœå« \r\nï¼Œå‡è®¾å‘½ä»¤ï¼›å¦åˆ™ passthrough
     bool is_likely_command = (memchr(rx_buffer, '\r', len) != NULL || memchr(rx_buffer, '\n', len) != NULL);
     if (!is_likely_command) {
         print_raw_data(rx_buffer, len);
@@ -312,7 +475,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (ret != 0) {
             ESP_LOGE(TAG, "Failed to compile regex: %d", ret);
             const char *response = "Internal error: regex compilation failed\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -322,7 +489,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (ret != 0) {
             ESP_LOGE(TAG, "Invalid BAUD command format: no match for '%s'", buf);
             const char *response = "Invalid BAUD command format\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -335,7 +506,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (baud_len >= sizeof(baud_str)) {
             ESP_LOGE(TAG, "BAUD value too long");
             const char *response = "Invalid baud rate\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -345,7 +520,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (*endptr != 0) {
             ESP_LOGE(TAG, "Invalid BAUD value: non-numeric '%s'", baud_str);
             const char *response = "Invalid baud rate\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -357,7 +536,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (stopbit_len >= sizeof(stopbit_str)) {
             ESP_LOGE(TAG, "STOPBIT value too long");
             const char *response = "Invalid stop bits\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -367,7 +550,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (*endptr != 0) {
             ESP_LOGE(TAG, "Invalid STOPBIT value: non-numeric '%s'", stopbit_str);
             const char *response = "Invalid stop bits\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -380,7 +567,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (parity_len >= sizeof(parity_str)) {
             ESP_LOGE(TAG, "PARITY value too long");
             const char *response = "Invalid parity\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -390,7 +581,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (*endptr != 0) {
             ESP_LOGE(TAG, "Invalid PARITY value: non-numeric '%s'", parity_str);
             const char *response = "Invalid parity\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -403,7 +598,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (databit_len >= sizeof(databit_str)) {
             ESP_LOGE(TAG, "DATABIT value too long");
             const char *response = "Invalid data bits\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -413,7 +612,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (*endptr != 0) {
             ESP_LOGE(TAG, "Invalid DATABIT value: non-numeric '%s'", databit_str);
             const char *response = "Invalid data bits\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -426,21 +629,33 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (new_baud < 110 || new_baud > 2000000) {
             ESP_LOGE(TAG, "Invalid baud rate: %u", new_baud);
             const char *response = "Invalid baud rate\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             return ESP_FAIL;
         }
 
         if (new_stop_bits != UART_STOP_BITS_1 && new_stop_bits != UART_STOP_BITS_2) {
             ESP_LOGE(TAG, "Invalid stop bits: %u (raw value: %u)", new_stop_bits, raw_stop_bits);
             const char *response = "Invalid stop bits\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             return ESP_FAIL;
         }
 
         if (new_parity != UART_PARITY_DISABLE && new_parity != UART_PARITY_ODD && new_parity != UART_PARITY_EVEN) {
             ESP_LOGE(TAG, "Invalid parity: %u", new_parity);
             const char *response = "Invalid parity\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             return ESP_FAIL;
         }
 
@@ -448,7 +663,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (raw_data_bits < 5 || raw_data_bits > 8) {
             ESP_LOGE(TAG, "Invalid data bits: %u", raw_data_bits);
             const char *response = "Invalid data bits\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             return ESP_FAIL;
         }
         uint8_t new_data_bits = raw_data_bits - 5;
@@ -493,13 +712,21 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
             if (strlen(ssid) == 0 || strlen(ssid) > 32 || !isprint((unsigned char)ssid[0])) {
                 ESP_LOGE(TAG, "Invalid SSID from server: %s", ssid);
                 const char *response = "Invalid SSID\r\n";
-                send(sock, response, strlen(response), 0);
+                if (is_tcp) {
+                    send(sock, response, strlen(response), 0);
+                } else {
+                    sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+                }
                 free(buf);
                 return ESP_FAIL;
             } else if (strlen(password) > 0 && (strlen(password) < 8 || strlen(password) > 64 || !isprint((unsigned char)password[0]))) {
                 ESP_LOGE(TAG, "Invalid password from server");
                 const char *response = "Invalid password\r\n";
-                send(sock, response, strlen(response), 0);
+                if (is_tcp) {
+                    send(sock, response, strlen(response), 0);
+                } else {
+                    sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+                }
                 free(buf);
                 return ESP_FAIL;
             } else {
@@ -512,7 +739,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         } else {
             ESP_LOGE(TAG, "Invalid WIFI command format from server");
             const char *response = "Invalid WIFI command format\r\n";
-            send(sock, response, strlen(response), 0);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             return ESP_FAIL;
         }
@@ -533,22 +764,27 @@ static void tcp_receive_task(void *pvParameters)
 
     while (1) {
         if (!is_tcp_connected || tcp_sock == -1) {
-            vTaskDelay(500 / portTICK_PERIOD_MS);  // ÑÓ³¤ÎŞÁ¬½Ó delay£¬±ÜÃâ CPU ¿Õ×ª
-            esp_task_wdt_reset();  // Î¹¹·
+            vTaskDelay(500 / portTICK_PERIOD_MS);  // å»¶é•¿æ— è¿æ¥ delayï¼Œé¿å… CPU ç©ºè½¬
+            esp_task_wdt_reset();  // å–‚ç‹—
             continue;
         }
 
         int len = recv(tcp_sock, rx_buffer, UART_BUF_SIZE - 1, 0);
         if (len < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                vTaskDelay(5 / portTICK_PERIOD_MS);  // Ëõ¶Ìµ½ 5ms£¬¸ü¼°Ê± poll
+                vTaskDelay(20 / portTICK_PERIOD_MS);  // FIX: Increased from 5ms to 20ms to reduce polling aggressiveness and allow lower-pri tasks (e.g., LED) to run
                 esp_task_wdt_reset();
                 continue;
             }
-            ESP_LOGW(TAG, "Receive failed: errno %d, reconnecting...", errno);  // ÆôÓÃ¾¯¸æÈÕÖ¾
+            ESP_LOGW(TAG, "Receive failed: errno %d, reconnecting...", errno);  // å¯ç”¨è­¦å‘Šæ—¥å¿—
             is_tcp_connected = false;
             close(tcp_sock);
             tcp_sock = -1;
+            if (is_wifi_connected()) {
+                current_led_state = LED_FAST_BLINK;
+            } else {
+                current_led_state = LED_SLOW_BLINK;
+            }
             vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
             esp_task_wdt_reset();
             continue;
@@ -557,18 +793,23 @@ static void tcp_receive_task(void *pvParameters)
             is_tcp_connected = false;
             close(tcp_sock);
             tcp_sock = -1;
+            if (is_wifi_connected()) {
+                current_led_state = LED_FAST_BLINK;
+            } else {
+                current_led_state = LED_SLOW_BLINK;
+            }
             vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
             esp_task_wdt_reset();
             continue;
         }
 
-        // ÓÅ»¯ debug hex log£ºlen > 200 Ê±½öÕªÒª£¬±ÜÃâÂıÑ­»·
+        // ä¼˜åŒ– debug hex logï¼šlen > 200 æ—¶ä»…æ‘˜è¦ï¼Œé¿å…æ…¢å¾ªç¯
         if (debug_mode) {
             if (len <= 200) {
                 char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};  // +1 for null
                 char *ptr = hex_buf;
                 for (int i = 0; i < len; i++) {
-                    ptr += sprintf(ptr, "%02X ", rx_buffer[i]);  // sprintf Ö±½Ó×·¼Ó£¬ÎŞ strlen
+                    ptr += sprintf(ptr, "%02X ", rx_buffer[i]);  // sprintf ç›´æ¥è¿½åŠ ï¼Œæ—  strlen
                 }
                 ESP_LOGI(TAG, "Raw TCP receive buffer (hex): %s (length: %d)", hex_buf, len);
             } else {
@@ -577,15 +818,98 @@ static void tcp_receive_task(void *pvParameters)
         }
 
         // Parse and process the received data
-        esp_err_t result = parse_tcp_command(tcp_sock, rx_buffer, len);
+        esp_err_t result = parse_command(tcp_sock, rx_buffer, len, true);
         if (result != ESP_OK) {
             ESP_LOGW(TAG, "Failed to parse TCP command (len=%d)", len);
         }
 
-        vTaskDelay(1 / portTICK_PERIOD_MS);  // Ëõ¶Ìµ½ 1ms£¬Ìá¸ß yield ÆµÂÊ
-        esp_task_wdt_reset();  // Ã¿Ñ­»·Î¹¹·
+        vTaskDelay(10 / portTICK_PERIOD_MS);  // FIX: Increased from 1ms to 10ms to yield more time to lower-priority tasks like LED
+        esp_task_wdt_reset();  // Ã¿Ñ­ï¿½ï¿½Î¹ï¿½ï¿½
     }
 
+    free(rx_buffer);
+    vTaskDelete(NULL);
+}
+
+static void udp_receive_task(void *pvParameters)
+{
+    uint8_t *rx_buffer = (uint8_t *) malloc(UART_BUF_SIZE);  // FIX: Changed to uint8_t* for binary
+    if (!rx_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate memory for UDP receive buffer");
+        vTaskDelete(NULL);
+    }
+
+    udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (udp_sock < 0) {
+        ESP_LOGE(TAG, "Unable to create UDP socket: errno %d", errno);
+        free(rx_buffer);
+        vTaskDelete(NULL);
+    }
+
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(UDP_PORT);
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(udp_sock, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+        ESP_LOGE(TAG, "UDP bind failed: errno %d", errno);
+        close(udp_sock);
+        free(rx_buffer);
+        vTaskDelete(NULL);
+    }
+
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 100000;  // 100 ms
+    setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    ESP_LOGI(TAG, "UDP receive task started on port %d", UDP_PORT);
+
+    while (1) {
+        int len = recv(udp_sock, rx_buffer, UART_BUF_SIZE - 1, 0);
+        if (len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+                esp_task_wdt_reset();
+                continue;
+            }
+            ESP_LOGW(TAG, "UDP receive failed: errno %d", errno);
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            esp_task_wdt_reset();
+            continue;
+        } else if (len == 0) {
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+            esp_task_wdt_reset();
+            continue;
+        }
+
+        // ï¿½Å»ï¿½ debug hex logï¿½ï¿½len > 200 Ê±ï¿½ï¿½ÕªÒªï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ñ­ï¿½ï¿½
+        if (debug_mode) {
+            if (len <= 200) {
+                char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};  // +1 for null
+                char *ptr = hex_buf;
+                for (int i = 0; i < len; i++) {
+                    ptr += sprintf(ptr, "%02X ", rx_buffer[i]);  // sprintf Ö±ï¿½ï¿½×·ï¿½Ó£ï¿½ï¿½ï¿½ strlen
+                }
+                ESP_LOGI(TAG, "Raw UDP receive buffer (hex): %s (length: %d)", hex_buf, len);
+            } else {
+                ESP_LOGI(TAG, "Large UDP packet received: %d bytes (hex log skipped)", len);
+            }
+        }
+
+        // Parse and process the received data
+        esp_err_t result = parse_command(udp_sock, rx_buffer, len, false);
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to parse UDP command (len=%d)", len);
+        }
+
+        vTaskDelay(1 / portTICK_PERIOD_MS);  // ï¿½ï¿½ï¿½Ìµï¿½ 1msï¿½ï¿½ï¿½ï¿½ï¿½ yield Æµï¿½ï¿½
+        esp_task_wdt_reset();  // Ã¿Ñ­ï¿½ï¿½Î¹ï¿½ï¿½
+    }
+
+    if (udp_sock >= 0) {
+        close(udp_sock);
+    }
     free(rx_buffer);
     vTaskDelete(NULL);
 }
@@ -615,6 +939,11 @@ static void uart_tcp_bridge_task(void *pvParameters)
                     close(tcp_sock);
                     tcp_sock = -1;
                     is_tcp_connected = false;
+                    if (is_wifi_connected()) {
+                        current_led_state = LED_FAST_BLINK;
+                    } else {
+                        current_led_state = LED_SLOW_BLINK;
+                    }
                 } else if (debug_mode) {
                     ESP_LOGI(TAG, "Transparent message sent: %s", cmd);
                 }
@@ -630,6 +959,7 @@ static void uart_tcp_bridge_task(void *pvParameters)
                 close(tcp_sock);
                 tcp_sock = -1;
                 is_tcp_connected = false;
+                current_led_state = LED_SLOW_BLINK;
             }
             vTaskDelay(1000 / portTICK_PERIOD_MS);
             esp_task_wdt_reset();
@@ -676,7 +1006,7 @@ static void uart_tcp_bridge_task(void *pvParameters)
                 continue;
             }
 
-            // ĞÂÔö£ºÉèÎª·Ç×èÈû
+            // æ–°å¢ï¼šè®¾ä¸ºéé˜»å¡
             int flags = fcntl(tcp_sock, F_GETFL, 0);
             if (flags < 0) {
                 ESP_LOGE(TAG, "fcntl F_GETFL failed: errno %d", errno);
@@ -699,16 +1029,23 @@ static void uart_tcp_bridge_task(void *pvParameters)
 
             // ESP_LOGI(TAG, "Successfully connected to %s:%d", HOST_IP_ADDR, PORT);
             is_tcp_connected = true;
+            current_led_state = LED_SOLID_ON;
+            vTaskDelay(10 / portTICK_PERIOD_MS);  // FIX: Added short yield after state change to allow low-pri LED task to execute promptly
         }
 
         vTaskDelay(10 / portTICK_PERIOD_MS);
-        esp_task_wdt_reset();  // Ã¿Ñ­»·Î¹¹·
+        esp_task_wdt_reset();  // æ¯å¾ªç¯å–‚ç‹—
     }
 
     if (tcp_sock != -1) {
         close(tcp_sock);
         tcp_sock = -1;
         is_tcp_connected = false;
+        if (is_wifi_connected()) {
+            current_led_state = LED_FAST_BLINK;
+        } else {
+            current_led_state = LED_SLOW_BLINK;
+        }
     }
     free(uart_data);
     free(rx_buffer);
@@ -772,9 +1109,44 @@ static void handle_boot_count(void)
     if (boot_count > BOOT_COUNT_THRESHOLD) {
         ESP_LOGW(TAG, "Boot count %u exceeds threshold %d, resetting to factory defaults", 
                  boot_count, BOOT_COUNT_THRESHOLD);
-        nvs_erase_all(nvs_handle);
-        nvs_commit(nvs_handle);
+
+        // Preserve auth_code before erasing
+        uint32_t auth_code = 0;
+        esp_err_t auth_err = nvs_get_u32(nvs_handle, "auth_code", &auth_code);
+        bool has_auth_code = (auth_err == ESP_OK);
+
+        // Erase all except auth_code
+        err = nvs_erase_all(nvs_handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to erase NVS: %s", esp_err_to_name(err));
+            nvs_close(nvs_handle);
+            return;
+        }
+        err = nvs_commit(nvs_handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to commit NVS erase: %s", esp_err_to_name(err));
+            nvs_close(nvs_handle);
+            return;
+        }
+
+        // Restore auth_code if it existed
+        if (has_auth_code) {
+            err = nvs_set_u32(nvs_handle, "auth_code", auth_code);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to restore auth_code: %s", esp_err_to_name(err));
+            } else {
+                err = nvs_commit(nvs_handle);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to commit restored auth_code: %s", esp_err_to_name(err));
+                } else {
+                    ESP_LOGI(TAG, "Auth code preserved during factory reset");
+                }
+            }
+        }
+
         nvs_close(nvs_handle);
+        ESP_LOGI(TAG, "Factory reset completed, restarting...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
         esp_restart();
     }
 
@@ -811,12 +1183,12 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
             s_retry_num = 0;
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            gpio_set_level(LED_PIN, 0); // LED on (active-low)
+            current_led_state = is_tcp_connected ? LED_SOLID_ON : LED_FAST_BLINK;
             break;
         case SYSTEM_EVENT_STA_DISCONNECTED:
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            gpio_set_level(LED_PIN, 1); // LED off (active-low)
+            current_led_state = LED_SLOW_BLINK;
             esp_wifi_connect();
             s_retry_num++;
             if (s_retry_num >= EXAMPLE_ESP_MAXIMUM_RETRY) {
@@ -879,6 +1251,10 @@ void wifi_init_sta(const char *ssid, const char *password)
 
 void app_main(void)
 {
+    esp_log_level_set("wifi", ESP_LOG_NONE);
+    esp_log_level_set("tcpip_adapter", ESP_LOG_NONE);
+    esp_log_level_set("*", ESP_LOG_NONE);  // å…œåº•ç¦ç”¨æ‰€æœ‰
+
     esp_err_t err = nvs_flash_init();
     if (err != ESP_OK) {
         nvs_flash_erase();
@@ -889,8 +1265,11 @@ void app_main(void)
         }
     }
 
-    // ³õÊ¼»¯ TWDT£ºESP8266 ÎŞ²ÎÊı°æ±¾
+    // åˆå§‹åŒ– TWDTï¼šESP8266 æ— å‚æ•°ç‰ˆæœ¬
     esp_task_wdt_init();
+
+    uart1_init();
+    esp_log_set_putchar(uart1_putchar);
 
     char ssid[32] = {0};
     char password[64] = {0};
@@ -903,13 +1282,22 @@ void app_main(void)
         current_parity = UART_PARITY_DISABLE;
         current_data_bits = UART_DATA_8_BITS;
         debug_mode = 0;
-        esp_log_level_set(TAG, ESP_LOG_NONE);
+        // esp_log_level_set(TAG, ESP_LOG_NONE);
     }
+
+    // Initialize server address for UDP responses
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    server_addr.sin_addr.s_addr = inet_addr(HOST_IP_ADDR);
 
     handle_boot_count();
     led_init();
+    xTaskCreate(led_task, "led_task", 2048, NULL, 5, NULL);  // Kept low priority as requested
     wifi_init_sta(ssid, password);
+    authorcodeverify();
     uart_init(current_baud_rate, current_stop_bits, current_parity, current_data_bits);
     xTaskCreate(uart_tcp_bridge_task, "uart_tcp_bridge", 6144, NULL, 8, NULL);
     xTaskCreate(tcp_receive_task, "tcp_receive", 6144, NULL, 8, NULL);
+    xTaskCreate(udp_receive_task, "udp_receive", 6144, NULL, 8, NULL);
 }
