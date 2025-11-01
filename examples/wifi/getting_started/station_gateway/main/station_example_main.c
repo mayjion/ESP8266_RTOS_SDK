@@ -12,6 +12,7 @@
    - Better logging: Conditional debug, hex dumps only for small packets (<128 bytes).
    - TWDT feeding: More frequent in hot loops.
    - Factory reset on 6 boots unchanged.
+   - Auth failure: Non-blocking LED indication (1s on, 3s off) without halting system.
 
    Compile and flash to ESP8266 as before. Test: Monitor logs for flush frequency; service should receive ~50B every ~5ms.
 */
@@ -25,6 +26,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -37,7 +39,6 @@
 #include <lwip/netdb.h>
 #include "driver/uart.h"
 #include "driver/gpio.h"
-#include <regex.h>
 #include "esp_timer.h"
 #include "esp_task_wdt.h"  // TWDT 支持
 #include "lwip/ip4_addr.h"  // 或通过 #include "tcpip_adapter.h" 间接包含
@@ -83,7 +84,7 @@ static bool is_tcp_connected = false;
 static int tcp_sock = -1;
 static uint8_t debug_mode = 1;
 
-// New: Store client's own IP address and gateway IP (discovered via UDP)
+// Store client's own IP address and gateway IP (discovered via UDP)
 static char my_ip_addr[16] = {0};  // e.g., "192.168.4.100"
 static char gateway_ip_addr[16] = {0};  // e.g., "192.168.4.1" (discovered)
 static bool gateway_ip_discovered = false;
@@ -96,6 +97,150 @@ static uint32_t last_reconnect_time = 0;
 
 char g_ssid[128] = {0};
 char g_password[128] = {0};
+
+static bool wifi_connected = false;
+
+// Auth failure flag
+static bool auth_failed = false;
+
+// Centralized connection state semaphore for thread-safety
+static SemaphoreHandle_t conn_state_mutex = NULL;
+
+static void conn_state_init(void) {
+    if (!conn_state_mutex) {
+        conn_state_mutex = xSemaphoreCreateMutex();
+    }
+}
+
+static void set_tcp_connected(bool connected) {
+    if (conn_state_mutex && xSemaphoreTake(conn_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        is_tcp_connected = connected;
+        xSemaphoreGive(conn_state_mutex);
+    }
+}
+
+static bool get_tcp_connected(void) {
+    bool connected;
+    if (conn_state_mutex && xSemaphoreTake(conn_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        connected = is_tcp_connected;
+        xSemaphoreGive(conn_state_mutex);
+        return connected;
+    }
+    return false;
+}
+
+static void led_status_task(void *pvParameters)
+{
+    while (1) {
+        if (auth_failed) {
+            // Auth failed: 亮1秒灭3秒 (active-low: 0=on, 1=off)
+            gpio_set_level(LED_PIN, 0);  // On
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            gpio_set_level(LED_PIN, 1);  // Off
+            vTaskDelay(3000 / portTICK_PERIOD_MS);
+        } else {
+            bool wifi_ok = wifi_connected;
+            bool tcp_ok = get_tcp_connected();
+            if (!wifi_ok) {
+                // WiFi 未连接：慢闪（1秒亮1秒灭）
+                gpio_set_level(LED_PIN, 0);
+                vTaskDelay(1000 / portTICK_PERIOD_MS);
+                gpio_set_level(LED_PIN, 1);
+                vTaskDelay(1000 / portTICK_PERIOD_MS);
+            } else if (wifi_ok && !tcp_ok) {
+                // WiFi 已连接但TCP未连接：快闪（200ms亮200ms灭）
+                gpio_set_level(LED_PIN, 0);
+                vTaskDelay(200 / portTICK_PERIOD_MS);
+                gpio_set_level(LED_PIN, 1);
+                vTaskDelay(200 / portTICK_PERIOD_MS);
+            } else if (wifi_ok && tcp_ok) {
+                // TCP 已连接：常亮
+                gpio_set_level(LED_PIN, 0);
+                vTaskDelay(1000 / portTICK_PERIOD_MS);  // 保持常亮
+            }
+        }
+        esp_task_wdt_reset();
+    }
+}
+
+
+/* CRC32 computation for ESP8266 */
+static uint32_t compute_crc32(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFF;
+    const uint32_t poly = 0xEDB88320;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 1) {
+                crc = (crc >> 1) ^ poly;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
+/* Author code verification - Non-blocking on failure */
+static void authorcodeverify(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for auth: %s", esp_err_to_name(err));
+        auth_failed = true;  // Set flag for LED indication
+        return;
+    }
+
+    uint8_t mac[6];
+    err = esp_wifi_get_mac(ESP_IF_WIFI_STA, mac);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get MAC: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        auth_failed = true;
+        return;
+    }
+
+    uint32_t computed_code = compute_crc32(mac, 6);
+
+    uint32_t stored_code = 0;
+    err = nvs_get_u32(nvs_handle, "auth_code", &stored_code);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        // First time, write the code
+        err = nvs_set_u32(nvs_handle, "auth_code", computed_code);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to write auth_code: %s", esp_err_to_name(err));
+            nvs_close(nvs_handle);
+            auth_failed = true;
+            return;
+        }
+        err = nvs_commit(nvs_handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to commit auth_code: %s", esp_err_to_name(err));
+        }
+        ESP_LOGI(TAG, "Auth code written successfully");
+        nvs_close(nvs_handle);
+        return;
+    } else if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read auth_code: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        auth_failed = true;
+        return;
+    }
+
+    // Verify
+    if (computed_code != stored_code) {
+        ESP_LOGE(TAG, "Auth verification failed. Computed: 0x%08x, Stored: 0x%08x", computed_code, stored_code);
+        nvs_close(nvs_handle);
+        auth_failed = true;  // Set flag instead of blocking
+        return;
+    }
+
+    ESP_LOGI(TAG, "Auth verification passed");
+    nvs_close(nvs_handle);
+}
+
 
 /* Initialize UART0 */
 static void uart_init(uint32_t baud_rate, uint8_t stop_bits, uint8_t parity, uint8_t data_bits)
@@ -230,48 +375,21 @@ static void save_nvs_config(uint32_t baud_rate, uint8_t stop_bits, uint8_t parit
 }
 
 /* Print raw data (binary-safe) to UART0 */
-static SemaphoreHandle_t raw_log_mutex = NULL;
-
-static void raw_log_init(void)
-{
-    if (!raw_log_mutex) {
-        raw_log_mutex = xSemaphoreCreateMutex();
-        if (!raw_log_mutex) {
-            ESP_LOGE(TAG, "Failed to create raw log mutex");
-        }
-    }
-}
-
 static void print_raw_data(const uint8_t *data, size_t len)
 {
     if (!data || len == 0) return;
 
-    // 喂 TWDT 前
     esp_task_wdt_reset();
 
-    static bool initialized = false;
-    if (!initialized) {
-        raw_log_init();
-        initialized = true;
+    int written = uart_write_bytes(UART_NUM_0, (const char *)data, len);
+    if (written != len) {
+        ESP_LOGW(TAG, "UART write incomplete: %d/%zu bytes", written, len);
     }
+    // 移除 uart_wait_tx_done()：避免阻塞，允许异步 TX
 
-    if (raw_log_mutex && xSemaphoreTake(raw_log_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        int written = uart_write_bytes(UART_NUM_0, (const char *)data, len);
-        if (written != len) {
-            ESP_LOGW(TAG, "UART write incomplete: %d/%zu bytes", written, len);
-        }
-        // 移除 uart_wait_tx_done()：避免阻塞，允许异步 TX
-        xSemaphoreGive(raw_log_mutex);
-    } else {
-        uart_write_bytes(UART_NUM_0, (const char *)data, len);
-        // 移除 uart_wait_tx_done()
-    }
-
-    // 喂 TWDT 后
     esp_task_wdt_reset();
 }
 
-/* Non-blocking send with retry */
 /* Non-blocking send with retry */
 static esp_err_t nonblocking_send(int sock, const char *payload, size_t payload_len, int max_retries) {
     size_t sent = 0;
@@ -335,7 +453,7 @@ static esp_err_t tcp_send_data(int sock, const char *payload, size_t payload_len
     return ESP_OK;
 }
 
-// New: Send client's IP to gateway upon TCP connection
+// Send client's IP to gateway upon TCP connection
 static void send_my_ip(int sock) {
     if (my_ip_addr[0] == '\0') {
         ESP_LOGW(TAG, "My IP not set yet, skipping send");
@@ -355,7 +473,7 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         return ESP_FAIL;
     }
 
-    // New: Check for targeted message format "TO:<target_ip>|<message>\r\n"
+    // Check for targeted message format "TO:<target_ip>|<message>\r\n"
     // Quick check: Look for '|' and ensure null-safe (no embedded 0x00 for commands)
     bool has_pipe = (memchr(rx_buffer, '|', len) != NULL);
     if (has_pipe && memcmp(rx_buffer, "TO:", 3) == 0 && memchr(rx_buffer, 0, len) == NULL) {
@@ -435,66 +553,27 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
             *cmd_end = 0;
         }
 
-        // Regex pattern (kept for format validation, but only use BAUD)
-        const char *pattern = "^BAUD=([0-9]+),STOPBIT=([0-9]+),PARITY=([0-9]+),DATABIT=([0-9]+)(\r\n)?$";
-        regex_t regex;
-        regmatch_t matches[5];
-        int ret = regcomp(&regex, pattern, REG_EXTENDED);
-        if (ret != 0) {
-            ESP_LOGE(TAG, "Failed to compile regex: %d", ret);
-            const char *response = "Internal error: regex compilation failed\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
-            free(buf);
-            regfree(&regex);
-            return ESP_FAIL;
-        }
+        // Manual parse for BAUD= (optimized, no regex since only baud used)
+        char *baud_start = buf + 5;  // Skip "BAUD="
+        char *baud_end = strchr(baud_start, ',');  // End at comma or \0
+        if (baud_end) *baud_end = 0;
+        else baud_end = strchr(baud_start, '\r');  // Or \r if no comma
+        if (baud_end) *baud_end = 0;
 
-        ret = regexec(&regex, buf, 5, matches, 0);
-        if (ret != 0) {
-            ESP_LOGE(TAG, "Invalid BAUD command format: no match for '%s'", buf);
-            const char *response = "Invalid BAUD command format\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
-            free(buf);
-            regfree(&regex);
-            return ESP_FAIL;
-        }
-
-        // Extract and convert only baud rate
+        // Validate and convert baud rate
         char *endptr;
-        char baud_str[32] = {0};
-        size_t baud_len = matches[1].rm_eo - matches[1].rm_so;
-        if (baud_len >= sizeof(baud_str)) {
-            ESP_LOGE(TAG, "BAUD value too long");
-            const char *response = "Invalid baud rate\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
-            free(buf);
-            regfree(&regex);
-            return ESP_FAIL;
-        }
-        strncpy(baud_str, buf + matches[1].rm_so, baud_len);
-        baud_str[baud_len] = '\0';
-        uint32_t new_baud = strtoul(baud_str, &endptr, 10);
-        if (*endptr != '\0') {
-            ESP_LOGE(TAG, "Invalid BAUD value: non-numeric '%s'", baud_str);
-            const char *response = "Invalid baud rate\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
-            free(buf);
-            regfree(&regex);
-            return ESP_FAIL;
-        }
-
-        regfree(&regex);
-        free(buf);
-
-        // Validate baud rate only
-        if (new_baud < 110 || new_baud > 2000000) {
+        uint32_t new_baud = strtoul(baud_start, &endptr, 10);
+        if (*endptr != '\0' || new_baud < 110 || new_baud > 2000000) {
             ESP_LOGE(TAG, "Invalid baud rate: %u", new_baud);
             const char *response = "Invalid baud rate\r\n";
             nonblocking_send(sock, response, strlen(response), 3);
+            free(buf);
             return ESP_FAIL;
         }
 
-        // Apply only baud rate change
+        free(buf);
+
+        // Apply baud rate change
         uart_set_baudrate(UART_NUM_0, new_baud);
 
         // Update global variable and save to NVS (keep others unchanged)
@@ -560,14 +639,14 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
 
 static void tcp_receive_task(void *pvParameters)
 {
-    uint8_t *rx_buffer = (uint8_t *) malloc(UART_BUF_SIZE);  // FIX: Changed to uint8_t* for binary
+    uint8_t *rx_buffer = (uint8_t *) malloc(UART_BUF_SIZE);
     if (!rx_buffer) {
         ESP_LOGE(TAG, "Failed to allocate memory for receive buffer");
         vTaskDelete(NULL);
     }
 
     while (1) {
-        if (!is_tcp_connected || tcp_sock == -1) {
+        if (!get_tcp_connected() || tcp_sock == -1) {
             vTaskDelay(100 / portTICK_PERIOD_MS);  // Reduced from 500ms, but not too aggressive
             esp_task_wdt_reset();  // 喂狗
             continue;
@@ -582,7 +661,7 @@ static void tcp_receive_task(void *pvParameters)
             }
             // Real disconnect: ECONNRESET, ETIMEDOUT, etc.
             ESP_LOGW(TAG, "TCP disconnect detected: errno %d, initiating backoff reconnect...", errno);
-            is_tcp_connected = false;
+            set_tcp_connected(false);
             close(tcp_sock);
             tcp_sock = -1;
             gpio_set_level(LED_PIN, 1); // LED off on disconnect
@@ -595,7 +674,7 @@ static void tcp_receive_task(void *pvParameters)
             continue;
         } else if (len == 0) {
             ESP_LOGI(TAG, "TCP connection closed by peer, initiating backoff reconnect...");
-            is_tcp_connected = false;
+            set_tcp_connected(false);
             close(tcp_sock);
             tcp_sock = -1;
             gpio_set_level(LED_PIN, 1); // LED off on disconnect
@@ -633,7 +712,7 @@ static void tcp_receive_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-// New: UDP discovery task - broadcasts for gateway IP, listens for response
+// UDP discovery task - broadcasts for gateway IP, listens for response
 static void udp_discovery_task(void *pvParameters)
 {
     char rx_buffer[128];
@@ -742,7 +821,77 @@ static void udp_discovery_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-/* UART command and TCP bridge task */
+/* Centralized TCP connect function */
+static esp_err_t tcp_connect(void) {
+    if (!gateway_ip_discovered || tcp_sock != -1) {
+        return ESP_FAIL;
+    }
+
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = inet_addr(gateway_ip_addr);
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(TCP_PORT);
+
+    tcp_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (tcp_sock < 0) {
+        ESP_LOGE(TAG, "Unable to create TCP socket: errno %d", errno);
+        return ESP_FAIL;
+    }
+
+    struct timeval timeout;
+    timeout.tv_sec = TCP_CONNECT_TIMEOUT_MS / 1000;
+    timeout.tv_usec = (TCP_CONNECT_TIMEOUT_MS % 1000) * 1000;
+    setsockopt(tcp_sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    setsockopt(tcp_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    // Enhanced keepalive: Shorter idle (5s) with fewer probes (3) for ~8s detection
+    int keepalive = 1;
+    int keepidle = 5;      // 5s idle before probes
+    int keepintvl = 1;     // 1s between probes
+    int keepcnt = 3;       // 3 probes
+    setsockopt(tcp_sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+    setsockopt(tcp_sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    setsockopt(tcp_sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    setsockopt(tcp_sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+    ESP_LOGI(TAG, "TCP Keepalive optimized: idle=5s, probes=3x1s (total ~8s detection)");
+
+    // Disable Nagle's algorithm for real-time small-packet sending
+    int nodelay = 1;
+    setsockopt(tcp_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+    ESP_LOGI(TAG, "TCP_NODELAY enabled for real-time sending");
+
+    // Set larger TCP send buffer (64kB)
+    int send_buf_size = 65536;  // 64kB
+    setsockopt(tcp_sock, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size));
+    if (debug_mode) ESP_LOGI(TAG, "Set TCP SO_SNDBUF to 64kB");
+
+    int err = connect(tcp_sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    if (err != 0) {
+        ESP_LOGW(TAG, "TCP unable to connect to %s:%d: errno %d", gateway_ip_addr, TCP_PORT, errno);
+        close(tcp_sock);
+        tcp_sock = -1;
+        return ESP_FAIL;
+    }
+
+    // Set non-blocking after connect
+    int flags = fcntl(tcp_sock, F_GETFL, 0);
+    if (flags >= 0 && fcntl(tcp_sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+        ESP_LOGE(TAG, "fcntl F_SETFL O_NONBLOCK failed: errno %d", errno);
+        close(tcp_sock);
+        tcp_sock = -1;
+        return ESP_FAIL;
+    }
+
+    // Send my IP to gateway after connect
+    send_my_ip(tcp_sock);
+
+    ESP_LOGI(TAG, "Successfully connected to gateway %s:%d (backoff reset)", gateway_ip_addr, TCP_PORT);
+    set_tcp_connected(true);
+    tcp_reconnect_delay_ms = TCP_RETRY_BASE_DELAY_MS;  // Reset backoff on success
+    gpio_set_level(LED_PIN, 0); // LED on (active-low) on TCP connect
+    return ESP_OK;
+}
+
 /* UART command and TCP bridge task */
 static void uart_tcp_bridge_task(void *pvParameters)
 {
@@ -767,7 +916,8 @@ static void uart_tcp_bridge_task(void *pvParameters)
             uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
             // Flush if batch >=100B or 5ms elapsed
             if (batch_len >= FLUSH_BATCH_SIZE || (now - last_flush >= FLUSH_INTERVAL_MS)) {
-                if (tcp_sock != -1 && is_tcp_connected) {
+                bool tcp_ok = get_tcp_connected();
+                if (tcp_sock != -1 && tcp_ok) {
                     esp_err_t send_result = tcp_send_data(tcp_sock, (char*)uart_batch, batch_len, rx_buffer, UART_BUF_SIZE, false);
                     if (send_result == ESP_ERR_TIMEOUT) {
                         ESP_LOGW(TAG, "Send timeout, skipping this batch but continuing (no drop, len=%u; will retry next)", (unsigned)batch_len);
@@ -775,7 +925,7 @@ static void uart_tcp_bridge_task(void *pvParameters)
                     } else if (send_result != ESP_OK) {
                         ESP_LOGW(TAG, "Fatal send error, closing socket and marking for reconnect (len=%u, err=%s)", 
                                 (unsigned)batch_len, esp_err_to_name(send_result));
-                        is_tcp_connected = false;
+                        set_tcp_connected(false);
                         if (tcp_sock != -1) {
                             close(tcp_sock);
                             tcp_sock = -1;
@@ -798,11 +948,11 @@ static void uart_tcp_bridge_task(void *pvParameters)
             if (tcp_sock != -1) {
                 close(tcp_sock);
                 tcp_sock = -1;
-                is_tcp_connected = false;
-                gpio_set_level(LED_PIN, 1); // LED off on disconnect
+                set_tcp_connected(false);
             }
             my_ip_addr[0] = '\0';  // Invalidate IP
             needs_rediscovery = true;  // Trigger rediscovery on reconnect
+            gateway_ip_discovered = false;
             batch_len = 0;  // Clear batch on disconnect
             vTaskDelay(1000 / portTICK_PERIOD_MS);
             esp_task_wdt_reset();
@@ -810,106 +960,26 @@ static void uart_tcp_bridge_task(void *pvParameters)
         }
 
         // Attempt TCP connect only if needed and gateway known
-        if (is_tcp_connected && tcp_sock != -1) {
+        bool tcp_ok = get_tcp_connected();
+        if (tcp_ok && tcp_sock != -1) {
             // Connection healthy, quick check
             vTaskDelay(1 / portTICK_PERIOD_MS);  // Minimal yield
-        } else if (gateway_ip_discovered || needs_rediscovery) {
+        } else if (needs_rediscovery) {
             // Trigger discovery if needed
-            if (needs_rediscovery) {
-                xTaskCreate(udp_discovery_task, "udp_discovery", 4096, NULL, 5, NULL);
-                needs_rediscovery = false;  // Prevent spam
-            }
-
-            if (gateway_ip_discovered && tcp_sock == -1) {
-                struct sockaddr_in dest_addr;
-                dest_addr.sin_addr.s_addr = inet_addr(gateway_ip_addr);
-                dest_addr.sin_family = AF_INET;
-                dest_addr.sin_port = htons(TCP_PORT);
-
-                tcp_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-                if (tcp_sock < 0) {
-                    ESP_LOGE(TAG, "Unable to create TCP socket: errno %d", errno);
-                    vTaskDelay(TCP_RETRY_BASE_DELAY_MS / portTICK_PERIOD_MS);
-                    esp_task_wdt_reset();
-                    continue;
+            xTaskCreate(udp_discovery_task, "udp_discovery", 4096, NULL, 5, NULL);
+            needs_rediscovery = false;  // Prevent spam
+            vTaskDelay(500 / portTICK_PERIOD_MS);  // Wait for discovery
+        } else if (gateway_ip_discovered && tcp_sock == -1) {
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (now - last_reconnect_time >= tcp_reconnect_delay_ms) {
+                esp_err_t connect_result = tcp_connect();
+                if (connect_result != ESP_OK) {
+                    last_reconnect_time = now;
+                    tcp_reconnect_delay_ms = (tcp_reconnect_delay_ms * 2 > TCP_RETRY_MAX_DELAY_MS) ? TCP_RETRY_MAX_DELAY_MS : tcp_reconnect_delay_ms * 2;
+                    vTaskDelay(100 / portTICK_PERIOD_MS);
                 }
-
-                struct timeval timeout;
-                timeout.tv_sec = TCP_CONNECT_TIMEOUT_MS / 1000;
-                timeout.tv_usec = (TCP_CONNECT_TIMEOUT_MS % 1000) * 1000;
-                setsockopt(tcp_sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-                setsockopt(tcp_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-                // Enhanced keepalive: Shorter idle (5s) with fewer probes (3) for ~8s detection
-                int keepalive = 1;
-                int keepidle = 5;      // 5s idle before probes
-                int keepintvl = 1;     // 1s between probes
-                int keepcnt = 3;       // 3 probes
-                setsockopt(tcp_sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
-                setsockopt(tcp_sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
-                setsockopt(tcp_sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
-                setsockopt(tcp_sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
-                ESP_LOGI(TAG, "TCP Keepalive optimized: idle=5s, probes=3x1s (total ~8s detection)");
-
-                // Disable Nagle's algorithm for real-time small-packet sending
-                int nodelay = 1;
-                setsockopt(tcp_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-                ESP_LOGI(TAG, "TCP_NODELAY enabled for real-time sending");
-
-                // 新增：设置更大的TCP send buffer (64kB)
-                int send_buf_size = 65536;  // 64kB
-                setsockopt(tcp_sock, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size));
-                if (debug_mode) ESP_LOGI(TAG, "Set TCP SO_SNDBUF to 64kB");
-
-                int err = connect(tcp_sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-                if (err != 0) {
-                    ESP_LOGW(TAG, "TCP unable to connect to %s:%d: errno %d", gateway_ip_addr, TCP_PORT, errno);
-                    close(tcp_sock);
-                    tcp_sock = -1;
-                    is_tcp_connected = false;
-                    gpio_set_level(LED_PIN, 1); // LED off on connect failure
-                    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                    if (now - last_reconnect_time > tcp_reconnect_delay_ms) {
-                        vTaskDelay(tcp_reconnect_delay_ms / portTICK_PERIOD_MS);
-                        tcp_reconnect_delay_ms = (tcp_reconnect_delay_ms * 2 > TCP_RETRY_MAX_DELAY_MS) ? TCP_RETRY_MAX_DELAY_MS : tcp_reconnect_delay_ms * 2;
-                        last_reconnect_time = now;
-                    }
-                    esp_task_wdt_reset();
-                    continue;
-                }
-
-                // Set non-blocking after connect
-                int flags = fcntl(tcp_sock, F_GETFL, 0);
-                if (flags < 0) {
-                    ESP_LOGE(TAG, "fcntl F_GETFL failed: errno %d", errno);
-                    close(tcp_sock);
-                    tcp_sock = -1;
-                    is_tcp_connected = false;
-                    gpio_set_level(LED_PIN, 1);
-                    vTaskDelay(TCP_RETRY_BASE_DELAY_MS / portTICK_PERIOD_MS);
-                    esp_task_wdt_reset();
-                    continue;
-                }
-                if (fcntl(tcp_sock, F_SETFL, flags | O_NONBLOCK) < 0) {
-                    ESP_LOGE(TAG, "fcntl F_SETFL O_NONBLOCK failed: errno %d", errno);
-                    close(tcp_sock);
-                    tcp_sock = -1;
-                    is_tcp_connected = false;
-                    gpio_set_level(LED_PIN, 1);
-                    vTaskDelay(TCP_RETRY_BASE_DELAY_MS / portTICK_PERIOD_MS);
-                    esp_task_wdt_reset();
-                    continue;
-                }
-
-                // Send my IP to gateway after connect
-                send_my_ip(tcp_sock);
-
-                ESP_LOGI(TAG, "Successfully connected to gateway %s:%d (backoff reset)", gateway_ip_addr, TCP_PORT);
-                is_tcp_connected = true;
-                tcp_reconnect_delay_ms = TCP_RETRY_BASE_DELAY_MS;  // Reset backoff on success
-                gpio_set_level(LED_PIN, 0); // LED on (active-low) on TCP connect
             } else {
-                vTaskDelay(500 / portTICK_PERIOD_MS);  // Wait for discovery
+                vTaskDelay(100 / portTICK_PERIOD_MS);
             }
         } else {
             vTaskDelay(1000 / portTICK_PERIOD_MS);  // No gateway, longer wait
@@ -921,8 +991,7 @@ static void uart_tcp_bridge_task(void *pvParameters)
     if (tcp_sock != -1) {
         close(tcp_sock);
         tcp_sock = -1;
-        is_tcp_connected = false;
-        gpio_set_level(LED_PIN, 1); // LED off on task end
+        set_tcp_connected(false);
     }
     free(uart_data);
     free(rx_buffer);
@@ -986,8 +1055,34 @@ static void handle_boot_count(void)
     if (boot_count > BOOT_COUNT_THRESHOLD) {
         ESP_LOGW(TAG, "Boot count %u exceeds threshold %d, resetting to factory defaults", 
                  boot_count, BOOT_COUNT_THRESHOLD);
+
+        // Preserve auth_code before erasing
+        uint32_t auth_code = 0;
+        esp_err_t auth_err = nvs_get_u32(nvs_handle, "auth_code", &auth_code);
+        bool has_auth_code = (auth_err == ESP_OK);
+
+        // Erase all except auth_code
         nvs_erase_all(nvs_handle);
-        nvs_commit(nvs_handle);
+        err = nvs_commit(nvs_handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to commit NVS erase: %s", esp_err_to_name(err));
+        }
+
+        // Restore auth_code if it existed
+        if (has_auth_code) {
+            err = nvs_set_u32(nvs_handle, "auth_code", auth_code);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to restore auth_code: %s", esp_err_to_name(err));
+            } else {
+                err = nvs_commit(nvs_handle);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to commit restored auth_code: %s", esp_err_to_name(err));
+                } else {
+                    ESP_LOGI(TAG, "Auth code preserved during factory reset");
+                }
+            }
+        }
+
         nvs_close(nvs_handle);
         esp_restart();
     }
@@ -1012,6 +1107,7 @@ static void handle_boot_count(void)
     }
 }
 
+
 static int s_retry_num = 0;
 
 static esp_err_t event_handler(void *ctx, system_event_t *event)
@@ -1022,30 +1118,30 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
             break;
         case SYSTEM_EVENT_STA_GOT_IP:
             // Close previous UDP socket if any to avoid EADDRINUSE on reconnect
+            wifi_connected = true;
             if (udp_sock >= 0) {
                 close(udp_sock);
                 udp_sock = -1;
             }
             // 修复：使用 ip4addr_ntoa 格式化 IPv4 地址
-            strcpy(my_ip_addr, ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
-            if (debug_mode) ESP_LOGI(TAG, "Got my IP: %s (triggering discovery if needed)", my_ip_addr);
+            char new_ip[16];
+            strcpy(new_ip, ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
+            if (debug_mode) ESP_LOGI(TAG, "Got my IP: %s (triggering discovery if needed)", new_ip);
             
             // Only rediscover if IP changed or first time
             static char prev_ip[16] = {0};  // Persistent across calls
-            if (strcmp(my_ip_addr, prev_ip) != 0 || needs_rediscovery) {
-                strcpy(prev_ip, my_ip_addr);
+            if (strcmp(new_ip, prev_ip) != 0 || needs_rediscovery) {
+                strcpy(prev_ip, new_ip);
+                strcpy(my_ip_addr, new_ip);
                 needs_rediscovery = true;
             }
             
             s_retry_num = 0;
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            // Start UDP discovery task only if needed
-            if (needs_rediscovery) {
-                xTaskCreate(udp_discovery_task, "udp_discovery", 4096, NULL, 5, NULL);
-            }
             break;
         case SYSTEM_EVENT_STA_DISCONNECTED:
+          wifi_connected = false;
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
             gpio_set_level(LED_PIN, 1); // LED off (active-low)
@@ -1057,7 +1153,7 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
             if (tcp_sock != -1) {
                 close(tcp_sock);
                 tcp_sock = -1;
-                is_tcp_connected = false;
+                set_tcp_connected(false);
             }
             if (udp_sock >= 0) {
                 close(udp_sock);
@@ -1151,8 +1247,11 @@ void app_main(void)
     }
 
     handle_boot_count();
+    conn_state_init();  // Initialize connection state mutex
     led_init();
+    xTaskCreate(led_status_task, "led_status", 2048, NULL, 1, NULL);  // Low priority LED task
     wifi_init_sta(g_ssid, g_password);
+    authorcodeverify();  // Now non-blocking on failure
     uart_init(current_baud_rate, current_stop_bits, current_parity, current_data_bits);
     xTaskCreate(uart_tcp_bridge_task, "uart_tcp_bridge", 6144, NULL, 8, NULL);
     xTaskCreate(tcp_receive_task, "tcp_receive", 6144, NULL, 8, NULL);
