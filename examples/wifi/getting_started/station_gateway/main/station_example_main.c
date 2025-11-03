@@ -13,6 +13,8 @@
    - TWDT feeding: More frequent in hot loops.
    - Factory reset on 6 boots unchanged.
    - Auth failure: Non-blocking LED indication (1s on, 3s off) without halting system.
+   - TCP framing: Length-prefixed (4-byte BE uint32) for UART data batches. Commands use \r\n. Accumulate received TCP data, prioritize length frames for data, fallback to \r\n for commands.
+   - Receive framing: Process length-prefixed frames first; fallback to \r\n or timeout flush for commands/unframed.
 
    Compile and flash to ESP8266 as before. Test: Monitor logs for flush frequency; service should receive ~50B every ~5ms.
 */
@@ -23,6 +25,7 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <math.h>  // For pow in backoff
+#include <stdint.h>  // For uint32_t
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -73,6 +76,12 @@ static const char *TAG = "slave";
 #define UART_READ_TIMEOUT_MS 1        // 1ms for real-time ~50B reads
 #define FLUSH_BATCH_SIZE 100          // Flush if batch >=100B
 #define FLUSH_INTERVAL_MS 5           // Or every 5ms
+#define FRAME_TIMEOUT_MS 20           // Flush accum if no new data for 20ms
+#define MAX_ACCUM_LEN 1024            // Max accum before force flush
+
+// Length-prefix framing
+#define FRAME_PREFIX_LEN 4
+#define MAX_FRAME_LEN 65535  // uint32 limit, but cap for safety
 
 #define LED_PIN GPIO_NUM_2
 
@@ -390,67 +399,51 @@ static void print_raw_data(const uint8_t *data, size_t len)
     esp_task_wdt_reset();
 }
 
-/* Non-blocking send with retry */
-static esp_err_t nonblocking_send(int sock, const char *payload, size_t payload_len, int max_retries) {
+// Auxiliary for length-prefix: Write big-endian uint32
+static void write_be32(uint8_t *buf, uint32_t value) {
+    buf[0] = (value >> 24) & 0xFF;
+    buf[1] = (value >> 16) & 0xFF;
+    buf[2] = (value >> 8) & 0xFF;
+    buf[3] = value & 0xFF;
+}
+
+// Auxiliary for length-prefix: Read big-endian uint32
+static uint32_t read_be32(const uint8_t *buf) {
+    return ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) | ((uint32_t)buf[2] << 8) | buf[3];
+}
+
+/* Non-blocking send with retry, returns bytes sent (>=0) or -1 (fatal) */
+static int nonblocking_send(int sock, const char *payload, size_t payload_len, int max_retries) {
+    if (payload_len == 0) return 0;
     size_t sent = 0;
+    int retries = max_retries;
     while (sent < payload_len) {
         int bytes = send(sock, payload + sent, payload_len - sent, 0);
         if (bytes > 0) {
             sent += bytes;
+            retries = max_retries;  /* 进展时重置重试，防止无进展死锁 */
             esp_task_wdt_reset();  // Feed during retries
             continue;
         }
         if (bytes < 0) {
             int lwip_errno = errno;
             if (lwip_errno == EAGAIN || lwip_errno == EWOULDBLOCK) {
-                if (--max_retries <= 0) {
-                    ESP_LOGW(TAG, "Send EAGAIN timeout after %d retries (buffer full?)", max_retries + 1);
-                    return ESP_ERR_TIMEOUT;  // Transient
+                if (--retries <= 0) {
+                    ESP_LOGW(TAG, "Send partial after %d retries: %zu/%zu bytes (buffer full?)", max_retries, sent, payload_len);
+                    return (int)sent;  /* 返回部分发送字节，而非 TIMEOUT */
                 }
-                vTaskDelay(1 / portTICK_PERIOD_MS);
+                vTaskDelay(2 / portTICK_PERIOD_MS);  /* 延迟增至 2ms，给排水时间 */
                 continue;
             } else {
                 ESP_LOGE(TAG, "Send real error: errno %d", lwip_errno);
-                return ESP_FAIL;  // Fatal
+                return -1;  /* 致命错误 */
             }
+        } else {  /* bytes == 0 */
+            ESP_LOGE(TAG, "Send returned 0, treating as error");
+            return -1;
         }
     }
-    return ESP_OK;
-}
-
-/* TCP send data with optional response expectation */
-static esp_err_t tcp_send_data(int sock, const char *payload, size_t payload_len, char *rx_buffer, size_t rx_buffer_size, bool expect_response)
-{
-    esp_err_t send_err = nonblocking_send(sock, payload, payload_len, 50);  // ~20ms retries
-    if (send_err == ESP_ERR_TIMEOUT) {
-        ESP_LOGW(TAG, "Transient send timeout, returning non-fatal");
-        return ESP_ERR_TIMEOUT;
-    } else if (send_err != ESP_OK) {
-        ESP_LOGE(TAG, "Fatal error during sending: %s", esp_err_to_name(send_err));
-        return ESP_FAIL;
-    }
-
-    if (!expect_response) {
-        return ESP_OK;
-    }
-
-    struct timeval timeout;
-    timeout.tv_sec = RESPONSE_TIMEOUT_MS / 1000;
-    timeout.tv_usec = (RESPONSE_TIMEOUT_MS % 1000) * 1000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-    int len = recv(sock, rx_buffer, rx_buffer_size - 1, 0);
-    if (len < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            ESP_LOGE(TAG, "No response from server within %d ms", RESPONSE_TIMEOUT_MS);
-            return ESP_FAIL;
-        }
-        ESP_LOGE(TAG, "recv failed: errno %d", errno);
-        return ESP_FAIL;
-    }
-
-    print_raw_data((uint8_t *)rx_buffer, len);
-    return ESP_OK;
+    return (int)sent;  /* 全发成功 */
 }
 
 // Send client's IP to gateway upon TCP connection
@@ -460,9 +453,12 @@ static void send_my_ip(int sock) {
         return;
     }
     char ip_msg[128];
-    int len = snprintf(ip_msg, sizeof(ip_msg), "{\"ip\":\"%s\",\"baud\":%d,\"ssid\":\"%s\",\"pwd\":\"%s\"}", my_ip_addr,current_baud_rate,g_ssid,g_password);
-    if (len > 0) {
-        nonblocking_send(sock, ip_msg, len, 5);  // Use non-blocking
+    int len = snprintf(ip_msg, sizeof(ip_msg), "{\"ip\":\"%s\",\"baud\":%d,\"ssid\":\"%s\",\"pwd\":\"%s\"}\r\n", my_ip_addr, current_baud_rate, g_ssid, g_password);
+    if (len > 0 && len < sizeof(ip_msg)) {
+        int sent = nonblocking_send(sock, ip_msg, len, 5);  // Use non-blocking
+        if (sent < 0) {
+            ESP_LOGW(TAG, "Failed to send IP message");
+        }
         if (debug_mode) ESP_LOGI(TAG, "Sent my IP to gateway: %s", ip_msg);
     }
 }
@@ -637,6 +633,17 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
     }
 }
 
+// Simple memmem for "\r\n"
+static uint8_t *find_rn(const uint8_t *haystack, size_t hay_len) {
+    if (hay_len < 2) return NULL;
+    for (size_t i = 0; i < hay_len - 1; ++i) {
+        if (haystack[i] == '\r' && haystack[i + 1] == '\n') {
+            return (uint8_t *)(haystack + i);
+        }
+    }
+    return NULL;
+}
+
 static void tcp_receive_task(void *pvParameters)
 {
     uint8_t *rx_buffer = (uint8_t *) malloc(UART_BUF_SIZE);
@@ -645,19 +652,121 @@ static void tcp_receive_task(void *pvParameters)
         vTaskDelete(NULL);
     }
 
+    // Accumulation buffer for framed messages (enlarged for prefix)
+    static uint8_t recv_accum[2048 + FRAME_PREFIX_LEN];
+    static size_t accum_len = 0;
+    static uint32_t last_data_time = 0;
+
+    uint8_t line_buf[UART_BUF_SIZE];
+
     while (1) {
         if (!get_tcp_connected() || tcp_sock == -1) {
+            // Clear accumulation on disconnect
+            accum_len = 0;
             vTaskDelay(100 / portTICK_PERIOD_MS);  // Reduced from 500ms, but not too aggressive
             esp_task_wdt_reset();  // 喂狗
             continue;
         }
 
         int len = recv(tcp_sock, rx_buffer, UART_BUF_SIZE - 1, 0);
-        if (len < 0) {
+        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (len > 0) {
+            last_data_time = now;
+
+            // Append to accumulation buffer
+            if (accum_len + len > sizeof(recv_accum)) {
+                ESP_LOGE(TAG, "Recv accumulation overflow (%zu + %d > %zu), resetting", accum_len, len, sizeof(recv_accum));
+                accum_len = 0;
+            }
+            memcpy(recv_accum + accum_len, rx_buffer, len);
+            accum_len += len;
+
+            // Prioritize length-prefixed frames (for data)
+            while (accum_len >= FRAME_PREFIX_LEN) {
+                uint32_t frame_len = read_be32(recv_accum);
+                size_t total_frame_len = FRAME_PREFIX_LEN + frame_len;
+                if (frame_len > MAX_FRAME_LEN || total_frame_len > sizeof(recv_accum)) {
+                    // Invalid length (e.g., commands like "BAUD=" interpret as large number), fallback to \r\n
+                    break;
+                }
+                if (accum_len >= total_frame_len) {
+                    // Complete frame: extract data (skip prefix)
+                    size_t data_len = frame_len;
+                    if (data_len > sizeof(line_buf)) {
+                        ESP_LOGW(TAG, "Frame data too long (%zu), partial process", data_len);
+                        data_len = sizeof(line_buf);
+                    }
+                    memcpy(line_buf, recv_accum + FRAME_PREFIX_LEN, data_len);
+
+                    // Transparent passthrough to UART (data, no parse)
+                    print_raw_data(line_buf, data_len);
+                    if (debug_mode) ESP_LOGI(TAG, "Processed length-framed data: %zu bytes", data_len);
+
+                    // Shift out processed frame
+                    size_t remaining = accum_len - total_frame_len;
+                    memmove(recv_accum, recv_accum + total_frame_len, remaining);
+                    accum_len = remaining;
+                    continue;  // Check for more frames
+                } else {
+                    break;  // Wait for more data
+                }
+            }
+
+            // Fallback: Process \r\n delimited lines (for commands)
+            while (accum_len >= 2) {
+                uint8_t *nl_pos = find_rn(recv_accum, accum_len);
+                if (!nl_pos) {
+                    break;  // No complete line
+                }
+
+                size_t line_len = nl_pos - recv_accum;
+                if (line_len == 0) {
+                    // Empty line, skip
+                    memmove(recv_accum, nl_pos + 2, accum_len - 2);
+                    accum_len -= 2;
+                    continue;
+                }
+
+                // Extract line (exclude \r\n)
+                if (line_len >= sizeof(line_buf)) {
+                    ESP_LOGW(TAG, "Line too long (%zu bytes), skipping", line_len);
+                    // Shift out the line + delimiter
+                    size_t to_shift = line_len + 2;
+                    memmove(recv_accum, nl_pos + 2, accum_len - to_shift);
+                    accum_len -= to_shift;
+                    continue;
+                }
+                memcpy(line_buf, recv_accum, line_len);
+
+                // 优化 debug hex log：len > 128 时仅摘要，避免慢循环
+                if (debug_mode && line_len <= 128) {
+                    char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};  // +1 for null
+                    char *ptr = hex_buf;
+                    for (int i = 0; i < (int)line_len; i++) {
+                        ptr += sprintf(ptr, "%02X ", line_buf[i]);  // sprintf 直接追加，无 strlen
+                    }
+                    ESP_LOGI(TAG, "Raw TCP line buffer (hex): %s (length: %zu)", hex_buf, line_len);
+                } else if (debug_mode) {
+                    ESP_LOGI(TAG, "TCP line received: %zu bytes (hex log skipped)", line_len);
+                }
+
+                // Parse and process the received line
+                esp_err_t result = parse_tcp_command(tcp_sock, line_buf, line_len);
+                if (result != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to parse TCP line (len=%zu)", line_len);
+                }
+
+                // Shift remaining data
+                size_t remaining = accum_len - (line_len + 2);
+                memmove(recv_accum, nl_pos + 2, remaining);
+                accum_len = remaining;
+            }
+        } else if (len < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 vTaskDelay(1 / portTICK_PERIOD_MS);  // 1ms yield for non-blocking
                 esp_task_wdt_reset();
-                continue;
+                // Check for timeout flush if accum has data
+                goto check_timeout;
             }
             // Real disconnect: ECONNRESET, ETIMEDOUT, etc.
             ESP_LOGW(TAG, "TCP disconnect detected: errno %d, initiating backoff reconnect...", errno);
@@ -668,6 +777,7 @@ static void tcp_receive_task(void *pvParameters)
             uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
             last_reconnect_time = now;
             tcp_reconnect_delay_ms = TCP_RETRY_BASE_DELAY_MS;  // Reset backoff on new disconnect
+            accum_len = 0;  // Clear on disconnect
             vTaskDelay(tcp_reconnect_delay_ms / portTICK_PERIOD_MS);
             tcp_reconnect_delay_ms = (tcp_reconnect_delay_ms * 2 > TCP_RETRY_MAX_DELAY_MS) ? TCP_RETRY_MAX_DELAY_MS : tcp_reconnect_delay_ms * 2;
             esp_task_wdt_reset();
@@ -681,28 +791,47 @@ static void tcp_receive_task(void *pvParameters)
             uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
             last_reconnect_time = now;
             tcp_reconnect_delay_ms = TCP_RETRY_BASE_DELAY_MS;  // Reset backoff
+            accum_len = 0;  // Clear on disconnect
             vTaskDelay(tcp_reconnect_delay_ms / portTICK_PERIOD_MS);
             tcp_reconnect_delay_ms = (tcp_reconnect_delay_ms * 2 > TCP_RETRY_MAX_DELAY_MS) ? TCP_RETRY_MAX_DELAY_MS : tcp_reconnect_delay_ms * 2;
             esp_task_wdt_reset();
             continue;
         }
 
-        // 优化 debug hex log：len > 128 时仅摘要，避免慢循环
-        if (debug_mode && len <= 128) {
-            char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};  // +1 for null
-            char *ptr = hex_buf;
-            for (int i = 0; i < len; i++) {
-                ptr += sprintf(ptr, "%02X ", rx_buffer[i]);  // sprintf 直接追加，无 strlen
-            }
-            ESP_LOGI(TAG, "Raw TCP receive buffer (hex): %s (length: %d)", hex_buf, len);
-        } else if (debug_mode) {
-            ESP_LOGI(TAG, "TCP packet received: %d bytes (hex log skipped)", len);
-        }
+check_timeout:
+        // Timeout-based flush for unframed data (no \r\n, fallback after prefix check)
+        if (accum_len > 0) {
+            if ((now - last_data_time > FRAME_TIMEOUT_MS) || (accum_len >= MAX_ACCUM_LEN)) {
+                if (debug_mode) {
+                    ESP_LOGI(TAG, "Flushing accum on timeout/size (%zu bytes, idle %ums)", accum_len, now - last_data_time);
+                }
+                if (accum_len <= sizeof(line_buf)) {
+                    memcpy(line_buf, recv_accum, accum_len);
 
-        // Parse and process the received data
-        esp_err_t result = parse_tcp_command(tcp_sock, rx_buffer, len);
-        if (result != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to parse TCP command (len=%d)", len);
+                    // 优化 debug hex log：len > 128 时仅摘要，避免慢循环
+                    if (debug_mode && accum_len <= 128) {
+                        char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};  // +1 for null
+                        char *ptr = hex_buf;
+                        for (int i = 0; i < (int)accum_len; i++) {
+                            ptr += sprintf(ptr, "%02X ", line_buf[i]);  // sprintf 直接追加，无 strlen
+                        }
+                        ESP_LOGI(TAG, "Raw TCP accum flush (hex): %s (length: %zu)", hex_buf, accum_len);
+                    } else if (debug_mode) {
+                        ESP_LOGI(TAG, "TCP accum flushed: %zu bytes (hex log skipped)", accum_len);
+                    }
+
+                    // Parse and process the accumulated data
+                    esp_err_t result = parse_tcp_command(tcp_sock, line_buf, accum_len);
+                    if (result != ESP_OK) {
+                        ESP_LOGW(TAG, "Failed to parse TCP accum (len=%zu)", accum_len);
+                    }
+
+                    accum_len = 0;
+                } else {
+                    ESP_LOGE(TAG, "Accum too large %zu, dropping", accum_len);
+                    accum_len = 0;
+                }
+            }
         }
 
         esp_task_wdt_reset();  // 每循环喂狗
@@ -892,7 +1021,8 @@ static esp_err_t tcp_connect(void) {
     return ESP_OK;
 }
 
-/* UART command and TCP bridge task */
+
+/* UART command and TCP bridge task - Enhanced with atomic prefix send */
 static void uart_tcp_bridge_task(void *pvParameters)
 {
     uint8_t *uart_data = (uint8_t *) malloc(UART_BUF_SIZE);
@@ -907,42 +1037,139 @@ static void uart_tcp_bridge_task(void *pvParameters)
     size_t batch_len = 0;
     uint32_t last_flush = 0;  // For periodic flush
 
+    /* 部分帧状态机变量 */
+    bool sending_partial = false;
+    size_t data_sent_for_current_frame = 0;
+    uint32_t current_frame_data_len = 0;
+    bool tcp_ok;  /* 提前声明 tcp_ok，避免标签后声明 */
+
     while (1) {
-        // Real-time read: Short 1ms timeout for ~50B chunks
+        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+        /* 如果部分发送中，暂停 UART 读取（backpressure），仅重试发送剩余 */
+        if (sending_partial) {
+            /* 检查超时：100ms 未完成，放弃帧，断开重连 */
+            if (now - last_flush > 100) {
+                ESP_LOGW(TAG, "Partial frame timeout after 100ms, dropping %zu bytes, reconnecting", batch_len);
+                sending_partial = false;
+                data_sent_for_current_frame = 0;
+                current_frame_data_len = 0;
+                batch_len = 0;
+                set_tcp_connected(false);
+                if (tcp_sock != -1) {
+                    close(tcp_sock);
+                    tcp_sock = -1;
+                }
+                gpio_set_level(LED_PIN, 1); // LED off
+            } else if (batch_len > 0 && (now - last_flush >= FLUSH_INTERVAL_MS)) {
+                /* 重试发送剩余（无前缀，仅 raw 数据） */
+                goto do_flush;
+            } else {
+                vTaskDelay(1 / portTICK_PERIOD_MS);  // 最小 yield
+            }
+            goto check_connect;  // 跳过正常读取和连接检查
+        }
+
+        /* 正常路径：实时读取 UART (短超时 ~1ms) */
         int len = uart_read_bytes(UART_NUM_0, uart_batch + batch_len, sizeof(uart_batch) - batch_len - 1, UART_READ_TIMEOUT_MS / portTICK_PERIOD_MS);
         if (len > 0) {
             batch_len += len;
-
-            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            // Flush if batch >=100B or 5ms elapsed
-            if (batch_len >= FLUSH_BATCH_SIZE || (now - last_flush >= FLUSH_INTERVAL_MS)) {
-                bool tcp_ok = get_tcp_connected();
-                if (tcp_sock != -1 && tcp_ok) {
-                    esp_err_t send_result = tcp_send_data(tcp_sock, (char*)uart_batch, batch_len, rx_buffer, UART_BUF_SIZE, false);
-                    if (send_result == ESP_ERR_TIMEOUT) {
-                        ESP_LOGW(TAG, "Send timeout, skipping this batch but continuing (no drop, len=%u; will retry next)", (unsigned)batch_len);
-                        // 不drop！重置batch，避免backlog；下循环重新累积
-                    } else if (send_result != ESP_OK) {
-                        ESP_LOGW(TAG, "Fatal send error, closing socket and marking for reconnect (len=%u, err=%s)", 
-                                (unsigned)batch_len, esp_err_to_name(send_result));
-                        set_tcp_connected(false);
-                        if (tcp_sock != -1) {
-                            close(tcp_sock);
-                            tcp_sock = -1;
-                        }
-                        gpio_set_level(LED_PIN, 1); // LED off
-                    } else if (debug_mode) {
-                        ESP_LOGI(TAG, "Flushed %zu bytes to TCP (real-time)", batch_len);
-                    }
-                    batch_len = 0;  // 始终重置batch（成功或timeout）
-                    last_flush = now;
-                } else {
-                    ESP_LOGE(TAG, "TCP not connected, dropping batched data (len=%u)", (unsigned)batch_len);
-                    batch_len = 0;  // 清空，避免累积
-                }
-            }
+            last_flush = now;  // 更新时间戳，避免误判空闲
         }
 
+        /* 检查 flush 条件：批次满或 5ms 超时 */
+        if (batch_len >= FLUSH_BATCH_SIZE || (now - last_flush >= FLUSH_INTERVAL_MS)) {
+do_flush:    /* 标签：从暂停路径跳转重试 */
+            tcp_ok = get_tcp_connected();  /* 赋值到提前声明的 tcp_ok */
+            if (tcp_sock != -1 && tcp_ok && batch_len > 0) {
+                size_t this_payload_len = 0;
+                const char *this_payload = NULL;
+                bool send_prefix = !sending_partial;  // 新帧才加前缀
+
+                if (send_prefix) {
+                    /* 新帧：检查大小并添加长度前缀 */
+                    if (batch_len > MAX_FRAME_LEN) {
+                        ESP_LOGE(TAG, "Batch too large for framing: %zu > %u, dropping", batch_len, MAX_FRAME_LEN);
+                        batch_len = 0;
+                        goto flush_done;
+                    }
+                    uint8_t framed_batch[UART_BUF_SIZE + FRAME_PREFIX_LEN];  // 临时缓冲
+                    write_be32(framed_batch, (uint32_t)batch_len);  // BE uint32 长度
+                    memcpy(framed_batch + FRAME_PREFIX_LEN, uart_batch, batch_len);
+                    // 原子发送前缀（高重试，直到完整）
+                    int prefix_sent = nonblocking_send(tcp_sock, (const char*)framed_batch, FRAME_PREFIX_LEN, 200);
+                    if (prefix_sent < FRAME_PREFIX_LEN) {
+                        ESP_LOGW(TAG, "Prefix incomplete: %d/%d, dropping frame", prefix_sent, FRAME_PREFIX_LEN);
+                        batch_len = 0;
+                        goto flush_done;
+                    }
+                    if (debug_mode) ESP_LOGI(TAG, "Sent prefix: %d bytes (len=%u)", FRAME_PREFIX_LEN, (uint32_t)batch_len);
+                    // 现在只发送数据部分
+                    this_payload = (const char*)(framed_batch + FRAME_PREFIX_LEN);
+                    this_payload_len = batch_len;
+                    current_frame_data_len = batch_len;  // 记录数据部分长度
+                    data_sent_for_current_frame = 0;
+                } else {
+                    /* 继续部分帧：仅发送剩余 raw 数据（无前缀） */
+                    this_payload = (const char*)uart_batch;
+                    this_payload_len = batch_len;
+                }
+
+                /* 非阻塞发送（数据部分） */
+                int sent = nonblocking_send(tcp_sock, this_payload, this_payload_len, 100);  // 100 次重试 ~100ms
+                if (sent < 0) {
+                    /* 致命错误：断开 */
+                    ESP_LOGW(TAG, "Fatal send error during %s, closing socket (len=%zu)", 
+                             send_prefix ? "data" : "partial retry", this_payload_len);
+                    set_tcp_connected(false);
+                    if (tcp_sock != -1) {
+                        close(tcp_sock);
+                        tcp_sock = -1;
+                    }
+                    gpio_set_level(LED_PIN, 1); // LED off
+                    sending_partial = false;
+                    data_sent_for_current_frame = 0;
+                    current_frame_data_len = 0;
+                    batch_len = 0;
+                    goto flush_done;
+                }
+
+                /* 计算本次数据部分发送量 */
+                size_t data_sent_this = (size_t)sent;
+                data_sent_for_current_frame += data_sent_this;
+
+                if (data_sent_for_current_frame >= current_frame_data_len) {
+                    /* 帧完整发送成功 */
+                    if (debug_mode) ESP_LOGI(TAG, "Flushed complete frame: %u bytes data (total sent: %d + %d)", 
+                                             current_frame_data_len, FRAME_PREFIX_LEN, (int)data_sent_for_current_frame);
+                    sending_partial = false;
+                    data_sent_for_current_frame = 0;
+                    current_frame_data_len = 0;
+                    batch_len = 0;
+                } else {
+                    /* 部分发送：更新剩余，进入暂停状态 */
+                    size_t remaining_data = current_frame_data_len - data_sent_for_current_frame;
+                    /* 移动缓冲区剩余数据（raw） */
+                    memmove(uart_batch, uart_batch + data_sent_this, remaining_data);
+                    batch_len = remaining_data;
+                    sending_partial = true;
+                    ESP_LOGW(TAG, "Partial data send: %zu/%u sent, remaining %zu (retry in %dms)", 
+                             data_sent_for_current_frame, current_frame_data_len, batch_len, FLUSH_INTERVAL_MS);
+                }
+            } else if (!tcp_ok || tcp_sock == -1) {
+                /* TCP 未连：丢弃批次 */
+                ESP_LOGE(TAG, "TCP not connected, dropping batched data (len=%zu)", (unsigned)batch_len);
+                sending_partial = false;
+                data_sent_for_current_frame = 0;
+                current_frame_data_len = 0;
+                batch_len = 0;
+            }
+flush_done:
+            last_flush = now;  // 更新时间戳
+        }
+
+check_connect:
+        /* 原 WiFi/TCP 连接逻辑（无变化） */
         if (!is_wifi_connected()) {
             if (debug_mode) ESP_LOGW(TAG, "WiFi not connected, closing socket");
             if (tcp_sock != -1) {
@@ -953,6 +1180,9 @@ static void uart_tcp_bridge_task(void *pvParameters)
             my_ip_addr[0] = '\0';  // Invalidate IP
             needs_rediscovery = true;  // Trigger rediscovery on reconnect
             gateway_ip_discovered = false;
+            sending_partial = false;  // 重置状态
+            data_sent_for_current_frame = 0;
+            current_frame_data_len = 0;
             batch_len = 0;  // Clear batch on disconnect
             vTaskDelay(1000 / portTICK_PERIOD_MS);
             esp_task_wdt_reset();
@@ -960,7 +1190,7 @@ static void uart_tcp_bridge_task(void *pvParameters)
         }
 
         // Attempt TCP connect only if needed and gateway known
-        bool tcp_ok = get_tcp_connected();
+        tcp_ok = get_tcp_connected();  /* 使用提前声明的 tcp_ok */
         if (tcp_ok && tcp_sock != -1) {
             // Connection healthy, quick check
             vTaskDelay(1 / portTICK_PERIOD_MS);  // Minimal yield
@@ -997,7 +1227,6 @@ static void uart_tcp_bridge_task(void *pvParameters)
     free(rx_buffer);
     vTaskDelete(NULL);
 }
-
 /* Timer callback to reset boot count */
 static void boot_count_reset_timer_callback(void *arg)
 {
