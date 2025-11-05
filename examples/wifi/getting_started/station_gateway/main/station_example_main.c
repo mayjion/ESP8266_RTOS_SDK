@@ -1,31 +1,26 @@
-/* WiFi Station with UART to TCP Bridge (Enhanced for UDP Discovery & Real-Time Sending)
-
-   This is an optimized version of the previous ESP8266 client code. Key optimizations for long connection stability and real-time UART-TCP bridging:
-   - Exponential backoff for TCP reconnects (1s, 2s, 4s, ..., up to 32s) to prevent rapid reconnect storms.
-   - Improved error handling in recv/send: Distinguish between EAGAIN (retry) and real disconnects (FIN/RST).
-   - Real-time UART reads: Short 1ms timeout for ~50B chunks, immediate or small-batch (100B) flush every ~5ms to TCP for low latency.
-   - Disabled Nagle's algorithm (TCP_NODELAY=1) to prevent buffering small packets, ensuring ~5ms end-to-end.
-   - UDP discovery only on WiFi IP change or initial connect; cache gateway IP across reconnects.
-   - Enhanced keepalive: Shorter idle (5s) with fewer probes (3) for faster disconnect detection (~8s total).
-   - Non-blocking send with retry loop to handle full buffers without closing socket.
-   - Reduced task delays: 1ms yield in loops for responsiveness without CPU spin.
-   - Better logging: Conditional debug, hex dumps only for small packets (<128 bytes).
-   - TWDT feeding: More frequent in hot loops.
-   - Factory reset on 6 boots unchanged.
-   - Auth failure: Non-blocking LED indication (1s on, 3s off) without halting system.
-   - TCP framing: Length-prefixed (4-byte BE uint32) for UART data batches. Commands use \r\n. Accumulate received TCP data, prioritize length frames for data, fallback to \r\n for commands.
-   - Receive framing: Process length-prefixed frames first; fallback to \r\n or timeout flush for commands/unframed.
-
-   Compile and flash to ESP8266 as before. Test: Monitor logs for flush frequency; service should receive ~50B every ~5ms.
+/* WiFi Station with UART to TCP Bridge (Modified for TCP Data Transparent Protocol)
+   This version implements the binary framing protocol with sequence numbers, ACK/NAK,
+   byte escaping, and CRC-16-CCITT. Key changes:
+   - Replaced length-prefix and \r\n parsing with protocol frames (Type, Seq, Len, Payload, CRC).
+   - UART data sent as Type=0x00 frames with incrementing Seq.
+   - Received frames parsed with unescaping and CRC verification.
+   - Commands (Type=0x01) parsed as TLV, handled (e.g., set baud/WiFi), respond with Type=0x02.
+   - Duplicate Seq detection (simple last Seq check).
+   - Removed TO: and legacy \r\n command parsing (BAUD=, WIFI=).
+   - Removed client IP/JSON send on connect (assumed handled by UDP discovery).
+   - Added CRC-16-CCITT, escape/unescape functions.
+   - Responses sent immediately for commands.
+   - Reboot on WiFi config change after ACK.
+   - Heartbeat (Type=0x03) ignored for now.
+   Compile and flash to ESP8266 as before.
 */
-
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <fcntl.h>
-#include <math.h>  // For pow in backoff
-#include <stdint.h>  // For uint32_t
+#include <stdint.h>
+#include <math.h> // For pow in backoff (unused but kept for completeness)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -43,48 +38,38 @@
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"
-#include "esp_task_wdt.h"  // TWDT 支持
-#include "lwip/ip4_addr.h"  // 或通过 #include "tcpip_adapter.h" 间接包含
-
-#define DEFAULT_ESP_WIFI_SSID      "Funlight"
-#define DEFAULT_ESP_WIFI_PASS      "funlight"
-#define EXAMPLE_ESP_MAXIMUM_RETRY  10
-#define NVS_NAMESPACE              "config"
-#define BOOT_COUNT_KEY             "boot_count"
-#define BOOT_COUNT_THRESHOLD       6
-#define BOOT_COUNT_RESET_DELAY_MS  10000 // 10 seconds
-
+#include "esp_task_wdt.h"
+#include "lwip/ip4_addr.h"
+#define DEFAULT_ESP_WIFI_SSID "Funlight"
+#define DEFAULT_ESP_WIFI_PASS "funlight"
+#define EXAMPLE_ESP_MAXIMUM_RETRY 10
+#define NVS_NAMESPACE "config"
+#define BOOT_COUNT_KEY "boot_count"
+#define BOOT_COUNT_THRESHOLD 6
+#define BOOT_COUNT_RESET_DELAY_MS 10000 // 10 seconds
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
+#define WIFI_FAIL_BIT BIT1
 static const char *TAG = "slave";
-
 #define TCP_PORT 12345
-#define UDP_PORT 12346  // UDP discovery port
+#define UDP_PORT 12346 // UDP discovery port
 #define UDP_BROADCAST_ADDR "255.255.255.255"
 #define UDP_DISCOVER_MSG "DISCOVER_GATEWAY\r\n"
 #define UDP_GATEWAY_RESP_PREFIX "GATEWAY_IP:"
 #define CONFIG_EXAMPLE_IPV4 1
 #define UART_BUF_SIZE (512)
-#define TCP_RETRY_BASE_DELAY_MS 1000  // Start with 1s
-#define TCP_RETRY_MAX_DELAY_MS 32000  // Cap at 32s
+#define TCP_RETRY_BASE_DELAY_MS 1000 // Start with 1s
+#define TCP_RETRY_MAX_DELAY_MS 32000 // Cap at 32s
 #define TCP_CONNECT_TIMEOUT_MS 10000
-#define TCP_KEEPALIVE_IDLE_MS 5000    // 5s idle before probes
-#define RESPONSE_TIMEOUT_MS 5000
+#define TCP_KEEPALIVE_IDLE_MS 5000 // 5s idle before probes
 #define UDP_DISCOVERY_TIMEOUT_MS 2000 // Reduced for faster discovery
-#define UDP_DISCOVERY_RETRIES 5       // Reduced retries
-#define UART_READ_TIMEOUT_MS 1        // 1ms for real-time ~50B reads
-#define FLUSH_BATCH_SIZE 100          // Flush if batch >=100B
-#define FLUSH_INTERVAL_MS 5           // Or every 5ms
-#define FRAME_TIMEOUT_MS 20           // Flush accum if no new data for 20ms
-#define MAX_ACCUM_LEN 1024            // Max accum before force flush
-
-// Length-prefix framing
-#define FRAME_PREFIX_LEN 4
-#define MAX_FRAME_LEN 65535  // uint32 limit, but cap for safety
-
+#define UDP_DISCOVERY_RETRIES 5 // Reduced retries
+#define UART_READ_TIMEOUT_MS 1 // 1ms for real-time ~50B reads
+#define FLUSH_BATCH_SIZE 100 // Flush if batch >=100B
+#define FLUSH_INTERVAL_MS 5 // Or every 5ms
+#define MAX_FRAME_UNESC 1024 // Max unescaped frame size (5 + 0xFFFF + 2, but cap)
+#define MAX_RAW_ACCUM 2048 // Raw accumulation with escapes
 #define LED_PIN GPIO_NUM_2
-
 static uint32_t current_baud_rate = 115200;
 static uint8_t current_stop_bits = UART_STOP_BITS_1;
 static uint8_t current_parity = UART_PARITY_DISABLE;
@@ -92,42 +77,80 @@ static uint8_t current_data_bits = UART_DATA_8_BITS;
 static bool is_tcp_connected = false;
 static int tcp_sock = -1;
 static uint8_t debug_mode = 1;
-
-// Store client's own IP address and gateway IP (discovered via UDP)
-static char my_ip_addr[16] = {0};  // e.g., "192.168.4.100"
-static char gateway_ip_addr[16] = {0};  // e.g., "192.168.4.1" (discovered)
+// Store gateway IP (discovered via UDP)
+static char gateway_ip_addr[16] = {0}; // e.g., "192.168.4.1" (discovered)
 static bool gateway_ip_discovered = false;
-static bool needs_rediscovery = true;  // Flag to trigger discovery only when needed
-static int udp_sock = -1;  // UDP socket for discovery
-
+static bool needs_rediscovery = true; // Flag to trigger discovery only when needed
+static int udp_sock = -1; // UDP socket for discovery
 // Reconnect backoff state
 static uint32_t tcp_reconnect_delay_ms = TCP_RETRY_BASE_DELAY_MS;
 static uint32_t last_reconnect_time = 0;
-
 char g_ssid[128] = {0};
 char g_password[128] = {0};
-
 static bool wifi_connected = false;
-
 // Auth failure flag
 static bool auth_failed = false;
-
 // Centralized connection state semaphore for thread-safety
 static SemaphoreHandle_t conn_state_mutex = NULL;
+static uint16_t out_seq = 0; // Outgoing sequence number
+static bool initial_info_sent = false; // Flag to ensure initial JSON sent once
+
+// Forward declarations
+static int nonblocking_send(int sock, const char *payload, size_t payload_len, int max_retries);
+static void udp_discovery_task(void *pvParameters);
+static uint32_t compute_crc32(const uint8_t *data, size_t len);
+static void build_and_send_frame(int sock, uint8_t type, uint16_t seq, const uint8_t *payload, size_t pay_len);
+
+// Send initial device info JSON as Type=0x00 frame
+static void send_initial_device_info(int sock) {
+  if (initial_info_sent) return;
+
+  // Get actual MAC
+  uint8_t mac[6];
+  esp_wifi_get_mac(ESP_IF_WIFI_STA, mac);
+  char mac_str[18];
+  sprintf(mac_str, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+  // Get actual IP
+  tcpip_adapter_ip_info_t ip_info;
+  tcpip_adapter_get_ip_info(ESP_IF_WIFI_STA, &ip_info);
+  char ip_str[16];
+  sprintf(ip_str, "%d.%d.%d.%d",
+          IP2STR(&ip_info.ip));
+
+  // Build JSON using sprintf
+  char json_str[256];  // Sufficient for this JSON
+int json_len = snprintf(json_str, sizeof(json_str),
+                            "{\"mac\":\"%s\",\"ip\":\"%s\",\"baud\":%u,\"ssid\":\"%s\",\"pwd\":\"%s\"}",
+                            mac_str, ip_str, current_baud_rate, g_ssid, g_password);
+
+
+  if (json_len > 0 && json_len < (int)sizeof(json_str)) {
+    build_and_send_frame(sock, 0x00 /* passthrough */, out_seq++, (const uint8_t *)json_str, (size_t)json_len);
+    ESP_LOGI(TAG, "Sent initial device info JSON (%d bytes)", json_len);
+    initial_info_sent = true;
+  } else {
+    ESP_LOGE(TAG, "Failed to build JSON string");
+  }
+}
 
 static void conn_state_init(void) {
     if (!conn_state_mutex) {
         conn_state_mutex = xSemaphoreCreateMutex();
     }
 }
-
 static void set_tcp_connected(bool connected) {
     if (conn_state_mutex && xSemaphoreTake(conn_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (!connected) {
+            initial_info_sent = false;
+        }
         is_tcp_connected = connected;
+        if (connected && !initial_info_sent && tcp_sock >= 0) {
+            send_initial_device_info(tcp_sock);
+        }
         xSemaphoreGive(conn_state_mutex);
     }
 }
-
 static bool get_tcp_connected(void) {
     bool connected;
     if (conn_state_mutex && xSemaphoreTake(conn_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -137,15 +160,14 @@ static bool get_tcp_connected(void) {
     }
     return false;
 }
-
 static void led_status_task(void *pvParameters)
 {
     while (1) {
         if (auth_failed) {
             // Auth failed: 亮1秒灭3秒 (active-low: 0=on, 1=off)
-            gpio_set_level(LED_PIN, 0);  // On
+            gpio_set_level(LED_PIN, 0); // On
             vTaskDelay(1000 / portTICK_PERIOD_MS);
-            gpio_set_level(LED_PIN, 1);  // Off
+            gpio_set_level(LED_PIN, 1); // Off
             vTaskDelay(3000 / portTICK_PERIOD_MS);
         } else {
             bool wifi_ok = wifi_connected;
@@ -165,14 +187,27 @@ static void led_status_task(void *pvParameters)
             } else if (wifi_ok && tcp_ok) {
                 // TCP 已连接：常亮
                 gpio_set_level(LED_PIN, 0);
-                vTaskDelay(1000 / portTICK_PERIOD_MS);  // 保持常亮
+                vTaskDelay(1000 / portTICK_PERIOD_MS); // 保持常亮
             }
         }
         esp_task_wdt_reset();
     }
 }
-
-
+/* CRC-16-CCITT implementation */
+static uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int j = 0; j < 8; j++) {
+            if (crc & 0x8000) {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    return crc;
+}
 /* CRC32 computation for ESP8266 */
 static uint32_t compute_crc32(const uint8_t *data, size_t len)
 {
@@ -190,7 +225,65 @@ static uint32_t compute_crc32(const uint8_t *data, size_t len)
     }
     return crc ^ 0xFFFFFFFF;
 }
-
+/* Escape data */
+static size_t escape_data(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_max) {
+    size_t out_idx = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        uint8_t b = in[i];
+        if (out_idx + 2 > out_max) return 0; // Overflow
+        if (b == 0xFF) {
+            out[out_idx++] = 0xFE;
+            out[out_idx++] = 0xDF;
+        } else if (b == 0xFE) {
+            out[out_idx++] = 0xFE;
+            out[out_idx++] = 0xDE;
+        } else {
+            out[out_idx++] = b;
+        }
+    }
+    return out_idx;
+}
+/* Build and send a frame */
+static void build_and_send_frame(int sock, uint8_t type, uint16_t seq, const uint8_t *payload, size_t pay_len) {
+    if (pay_len > 0xFFFF) {
+        ESP_LOGE(TAG, "Payload too long: %zu", pay_len);
+        return;
+    }
+    // Unescaped body without CRC
+    size_t unesc_len = 1 + 2 + 2 + pay_len;
+    uint8_t unesc[unesc_len + 2]; // +2 for CRC
+    unesc[0] = type;
+    unesc[1] = (seq >> 8) & 0xFF;
+    unesc[2] = seq & 0xFF;
+    unesc[3] = (pay_len >> 8) & 0xFF;
+    unesc[4] = pay_len & 0xFF;
+    if (pay_len > 0) {
+        memcpy(unesc + 5, payload, pay_len);
+    }
+    // Compute CRC
+    uint16_t crc = crc16_ccitt(unesc, unesc_len);
+    unesc[unesc_len] = (crc >> 8) & 0xFF;
+    unesc[unesc_len + 1] = crc & 0xFF;
+    // Escape the full body (including CRC)
+    uint8_t esc_body[(unesc_len + 2) * 2];
+    size_t esc_len = escape_data(unesc, unesc_len + 2, esc_body, sizeof(esc_body));
+    if (esc_len == 0) {
+        ESP_LOGE(TAG, "Escape failed");
+        return;
+    }
+    // Full frame
+    uint8_t full_frame[2 + esc_len];
+    full_frame[0] = 0xFF;
+    full_frame[1] = 0xFF;
+    memcpy(full_frame + 2, esc_body, esc_len);
+    // Send
+    int sent = nonblocking_send(sock, (const char *)full_frame, 2 + esc_len, 10);
+    if (sent == (int)(2 + esc_len)) {
+        if (debug_mode) ESP_LOGI(TAG, "Sent frame type=0x%02X seq=%04X len=%zu", type, seq, pay_len);
+    } else {
+        ESP_LOGW(TAG, "Incomplete frame send: %d/%zu", sent, 2 + esc_len);
+    }
+}
 /* Author code verification - Non-blocking on failure */
 static void authorcodeverify(void)
 {
@@ -198,10 +291,9 @@ static void authorcodeverify(void)
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open NVS for auth: %s", esp_err_to_name(err));
-        auth_failed = true;  // Set flag for LED indication
+        auth_failed = true; // Set flag for LED indication
         return;
     }
-
     uint8_t mac[6];
     err = esp_wifi_get_mac(ESP_IF_WIFI_STA, mac);
     if (err != ESP_OK) {
@@ -210,9 +302,7 @@ static void authorcodeverify(void)
         auth_failed = true;
         return;
     }
-
     uint32_t computed_code = compute_crc32(mac, 6);
-
     uint32_t stored_code = 0;
     err = nvs_get_u32(nvs_handle, "auth_code", &stored_code);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
@@ -237,20 +327,16 @@ static void authorcodeverify(void)
         auth_failed = true;
         return;
     }
-
     // Verify
     if (computed_code != stored_code) {
         ESP_LOGE(TAG, "Auth verification failed. Computed: 0x%08x, Stored: 0x%08x", computed_code, stored_code);
         nvs_close(nvs_handle);
-        auth_failed = true;  // Set flag instead of blocking
+        auth_failed = true; // Set flag instead of blocking
         return;
     }
-
     ESP_LOGI(TAG, "Auth verification passed");
     nvs_close(nvs_handle);
 }
-
-
 /* Initialize UART0 */
 static void uart_init(uint32_t baud_rate, uint8_t stop_bits, uint8_t parity, uint8_t data_bits)
 {
@@ -271,13 +357,13 @@ static void uart_init(uint32_t baud_rate, uint8_t stop_bits, uint8_t parity, uin
         ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(err));
     }
 }
-
 /* Check WiFi connection status */
 static bool is_wifi_connected(void)
 {
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, 100 / portTICK_PERIOD_MS);
     return (bits & WIFI_CONNECTED_BIT) != 0;
 }
+
 
 /* Initialize LED on GPIO2 */
 static void led_init(void)
@@ -295,7 +381,6 @@ static void led_init(void)
     }
     gpio_set_level(LED_PIN, 1); // LED off (active-low) by default
 }
-
 /* Load configurations from NVS */
 static esp_err_t load_nvs_config(uint32_t *baud_rate, uint8_t *stop_bits, uint8_t *parity, uint8_t *data_bits, char *ssid, size_t ssid_len, char *password, size_t pass_len, uint8_t *debug)
 {
@@ -311,7 +396,6 @@ static esp_err_t load_nvs_config(uint32_t *baud_rate, uint8_t *stop_bits, uint8_
         *debug = 0;
         return err;
     }
-
     size_t len = ssid_len;
     err = nvs_get_str(nvs_handle, "wifi_ssid", ssid, &len);
     if (err != ESP_OK || len == 0) {
@@ -343,7 +427,6 @@ static esp_err_t load_nvs_config(uint32_t *baud_rate, uint8_t *stop_bits, uint8_
         *debug = 0;
     }
     nvs_close(nvs_handle);
-
     if (ssid[0] == '\0' || strlen(ssid) > 32 || !isprint((unsigned char)ssid[0])) {
         strlcpy(ssid, DEFAULT_ESP_WIFI_SSID, ssid_len);
     }
@@ -351,11 +434,9 @@ static esp_err_t load_nvs_config(uint32_t *baud_rate, uint8_t *stop_bits, uint8_
     if (pass_length > 0 && (pass_length < 8 || pass_length > 64 || !isprint((unsigned char)password[0]))) {
         strlcpy(password, DEFAULT_ESP_WIFI_PASS, pass_len);
     }
-
     esp_log_level_set(TAG, *debug ? ESP_LOG_INFO : ESP_LOG_NONE);
     return ESP_OK;
 }
-
 /* Save configurations to NVS */
 static void save_nvs_config(uint32_t baud_rate, uint8_t stop_bits, uint8_t parity, uint8_t data_bits, const char *ssid, const char *password, uint8_t debug)
 {
@@ -382,36 +463,25 @@ static void save_nvs_config(uint32_t baud_rate, uint8_t stop_bits, uint8_t parit
     }
     nvs_close(nvs_handle);
 }
-
 /* Print raw data (binary-safe) to UART0 */
 static void print_raw_data(const uint8_t *data, size_t len)
 {
     if (!data || len == 0) return;
-
     esp_task_wdt_reset();
-
     int written = uart_write_bytes(UART_NUM_0, (const char *)data, len);
     if (written != len) {
         ESP_LOGW(TAG, "UART write incomplete: %d/%zu bytes", written, len);
     }
     // 移除 uart_wait_tx_done()：避免阻塞，允许异步 TX
-
     esp_task_wdt_reset();
 }
-
-// Auxiliary for length-prefix: Write big-endian uint32
+// Auxiliary for big-endian uint32
 static void write_be32(uint8_t *buf, uint32_t value) {
     buf[0] = (value >> 24) & 0xFF;
     buf[1] = (value >> 16) & 0xFF;
     buf[2] = (value >> 8) & 0xFF;
     buf[3] = value & 0xFF;
 }
-
-// Auxiliary for length-prefix: Read big-endian uint32
-static uint32_t read_be32(const uint8_t *buf) {
-    return ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) | ((uint32_t)buf[2] << 8) | buf[3];
-}
-
 /* Non-blocking send with retry, returns bytes sent (>=0) or -1 (fatal) */
 static int nonblocking_send(int sock, const char *payload, size_t payload_len, int max_retries) {
     if (payload_len == 0) return 0;
@@ -421,8 +491,8 @@ static int nonblocking_send(int sock, const char *payload, size_t payload_len, i
         int bytes = send(sock, payload + sent, payload_len - sent, 0);
         if (bytes > 0) {
             sent += bytes;
-            retries = max_retries;  /* 进展时重置重试，防止无进展死锁 */
-            esp_task_wdt_reset();  // Feed during retries
+            retries = max_retries; /* 进展时重置重试，防止无进展死锁 */
+            esp_task_wdt_reset(); // Feed during retries
             continue;
         }
         if (bytes < 0) {
@@ -430,570 +500,57 @@ static int nonblocking_send(int sock, const char *payload, size_t payload_len, i
             if (lwip_errno == EAGAIN || lwip_errno == EWOULDBLOCK) {
                 if (--retries <= 0) {
                     ESP_LOGW(TAG, "Send partial after %d retries: %zu/%zu bytes (buffer full?)", max_retries, sent, payload_len);
-                    return (int)sent;  /* 返回部分发送字节，而非 TIMEOUT */
+                    return (int)sent; /* 返回部分发送字节，而非 TIMEOUT */
                 }
-                vTaskDelay(2 / portTICK_PERIOD_MS);  /* 延迟增至 2ms，给排水时间 */
+                vTaskDelay(2 / portTICK_PERIOD_MS); /* 延迟增至 2ms，给排水时间 */
                 continue;
             } else {
                 ESP_LOGE(TAG, "Send real error: errno %d", lwip_errno);
-                return -1;  /* 致命错误 */
+                return -1; /* 致命错误 */
             }
-        } else {  /* bytes == 0 */
+        } else { /* bytes == 0 */
             ESP_LOGE(TAG, "Send returned 0, treating as error");
             return -1;
         }
     }
-    return (int)sent;  /* 全发成功 */
+    return (int)sent; /* 全发成功 */
 }
-
-// Send client's IP to gateway upon TCP connection
-static void send_my_ip(int sock) {
-    if (my_ip_addr[0] == '\0') {
-        ESP_LOGW(TAG, "My IP not set yet, skipping send");
-        return;
-    }
-    char ip_msg[128];
-    int len = snprintf(ip_msg, sizeof(ip_msg), "{\"ip\":\"%s\",\"baud\":%d,\"ssid\":\"%s\",\"pwd\":\"%s\"}\r\n", my_ip_addr, current_baud_rate, g_ssid, g_password);
-    if (len > 0 && len < sizeof(ip_msg)) {
-        int sent = nonblocking_send(sock, ip_msg, len, 5);  // Use non-blocking
-        if (sent < 0) {
-            ESP_LOGW(TAG, "Failed to send IP message");
-        }
-        if (debug_mode) ESP_LOGI(TAG, "Sent my IP to gateway: %s", ip_msg);
-    }
-}
-
-static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t len)
-{
-    if (!rx_buffer || len == 0) {
-        return ESP_FAIL;
-    }
-
-    // Check for targeted message format "TO:<target_ip>|<message>\r\n"
-    // Quick check: Look for '|' and ensure null-safe (no embedded 0x00 for commands)
-    bool has_pipe = (memchr(rx_buffer, '|', len) != NULL);
-    if (has_pipe && memcmp(rx_buffer, "TO:", 3) == 0 && memchr(rx_buffer, 0, len) == NULL) {
-        // Safe to null-terminate for parsing
-        char *buf = (char *)malloc(len + 1);
-        if (!buf) {
-            ESP_LOGE(TAG, "Failed to allocate buf for TO command");
-            return ESP_FAIL;
-        }
-        memcpy(buf, rx_buffer, len);
-        buf[len] = 0;
-
-        // Find pipe and trim to \r\n if present
-        char *pipe_pos = strchr(buf + 3, '|');  // Skip "TO:"
-        if (pipe_pos) {
-            *pipe_pos = 0;  // Split target_ip
-            char *target_ip = buf + 3;
-            char *message = pipe_pos + 1;
-
-            // Trim message end (\r\n)
-            char *end = strstr(message, "\r\n");
-            if (end) *end = 0;
-
-            // Validate target_ip (simple IPv4 check: 3 dots, numeric)
-            bool valid_ip = (strchr(target_ip, '.') != NULL && strchr(target_ip, '.') != strrchr(target_ip, '.') &&
-                             strchr(target_ip, '.') != strrchr(target_ip, '.') + 1 && strlen(target_ip) <= 15);
-            if (!valid_ip || my_ip_addr[0] == '\0') {
-                ESP_LOGW(TAG, "Invalid target IP or my IP not set: %s", target_ip);
-                free(buf);
-                return ESP_OK;  // Ignore invalid
-            }
-
-            // Check if matches my IP
-            if (strcmp(target_ip, my_ip_addr) == 0) {
-                // Transparently forward message to UART (MCU)
-                size_t msg_len = strlen(message);
-                print_raw_data((uint8_t *)message, msg_len);
-                if (debug_mode) ESP_LOGI(TAG, "Targeted message for my IP (%s) forwarded to MCU: %s", my_ip_addr, message);
-                free(buf);
-                return ESP_OK;
-            } else {
-                ESP_LOGI(TAG, "Message for other IP (%s), ignoring: %s", target_ip, message);
-                free(buf);
-                return ESP_OK;
-            }
-        }
-        free(buf);
-    }
-
-    // 快速路径：如果含 \r\n，假设命令；否则 passthrough
-    bool is_likely_command = (memchr(rx_buffer, '\r', len) != NULL || memchr(rx_buffer, '\n', len) != NULL);
-    if (!is_likely_command) {
-        print_raw_data(rx_buffer, len);
-        return ESP_OK;
-    }
-
-    // Existing: Check if potential BAUD command
-    if (len >= 5 && memcmp(rx_buffer, "BAUD=", 5) == 0) {
-        // Check for embedded 0x00; if present, treat as transparent binary data
-        if (memchr(rx_buffer, 0, len) != NULL) {
-            print_raw_data(rx_buffer, len);
-            return ESP_OK;
-        }
-
-        // Safe to make null-terminated copy
-        char *buf = (char *)malloc(len + 1);
-        if (!buf) {
-            ESP_LOGE(TAG, "Failed to allocate buf for command");
-            return ESP_FAIL;
-        }
-        memcpy(buf, rx_buffer, len);
-        buf[len] = 0;
-
-        // Trim to first \r\n if present
-        char *cmd_end = strstr(buf, "\r\n");
-        if (cmd_end) {
-            *cmd_end = 0;
-        }
-
-        // Manual parse for BAUD= (optimized, no regex since only baud used)
-        char *baud_start = buf + 5;  // Skip "BAUD="
-        char *baud_end = strchr(baud_start, ',');  // End at comma or \0
-        if (baud_end) *baud_end = 0;
-        else baud_end = strchr(baud_start, '\r');  // Or \r if no comma
-        if (baud_end) *baud_end = 0;
-
-        // Validate and convert baud rate
-        char *endptr;
-        uint32_t new_baud = strtoul(baud_start, &endptr, 10);
-        if (*endptr != '\0' || new_baud < 110 || new_baud > 2000000) {
-            ESP_LOGE(TAG, "Invalid baud rate: %u", new_baud);
-            const char *response = "Invalid baud rate\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
-            free(buf);
-            return ESP_FAIL;
-        }
-
-        free(buf);
-
-        // Apply baud rate change
-        uart_set_baudrate(UART_NUM_0, new_baud);
-
-        // Update global variable and save to NVS (keep others unchanged)
-        current_baud_rate = new_baud;
-        save_nvs_config(new_baud, current_stop_bits, current_parity, current_data_bits, NULL, NULL, debug_mode);
-        return ESP_OK;
-    } else if (len >= 5 && memcmp(rx_buffer, "WIFI=", 5) == 0) {
-        // Similar fix for WIFI command: check for 0x00
-        if (memchr(rx_buffer, 0, len) != NULL) {
-            print_raw_data(rx_buffer, len);
-            return ESP_OK;
-        }
-
-        // Safe to make null-terminated copy
-        char *buf = (char *)malloc(len + 1);
-        if (!buf) {
-            ESP_LOGE(TAG, "Failed to allocate buf for command");
-            return ESP_FAIL;
-        }
-        memcpy(buf, rx_buffer, len);
-        buf[len] = 0;
-
-        char *ssid = buf + 5;
-        char *password = strchr(ssid, ',');
-        if (password) {
-            *password = 0;
-            password++;
-            char *end = strchr(password, '\r');
-            if (end) *end = 0;
-
-            if (strlen(ssid) == 0 || strlen(ssid) > 32 || !isprint((unsigned char)ssid[0])) {
-                ESP_LOGE(TAG, "Invalid SSID from server: %s", ssid);
-                const char *response = "Invalid SSID\r\n";
-                nonblocking_send(sock, response, strlen(response), 3);
-                free(buf);
-                return ESP_FAIL;
-            } else if (strlen(password) > 0 && (strlen(password) < 8 || strlen(password) > 64 || !isprint((unsigned char)password[0]))) {
-                ESP_LOGE(TAG, "Invalid password from server");
-                const char *response = "Invalid password\r\n";
-                nonblocking_send(sock, response, strlen(response), 3);
-                free(buf);
-                return ESP_FAIL;
-            } else {
-                save_nvs_config(current_baud_rate, current_stop_bits, current_parity, current_data_bits, ssid, password, debug_mode);
-                ESP_LOGI(TAG, "WiFi configuration from server successful: SSID=%s", ssid);
-                free(buf);
-                esp_restart();
-                return ESP_OK;
-            }
-        } else {
-            ESP_LOGE(TAG, "Invalid WIFI command format from server");
-            const char *response = "Invalid WIFI command format\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
-            free(buf);
-            return ESP_FAIL;
-        }
-    } else {
-        // Not a command: transparent binary passthrough, send full len to UART
-        print_raw_data(rx_buffer, len);
-        return ESP_OK;
-    }
-}
-
-// Simple memmem for "\r\n"
-static uint8_t *find_rn(const uint8_t *haystack, size_t hay_len) {
-    if (hay_len < 2) return NULL;
-    for (size_t i = 0; i < hay_len - 1; ++i) {
-        if (haystack[i] == '\r' && haystack[i + 1] == '\n') {
-            return (uint8_t *)(haystack + i);
-        }
-    }
-    return NULL;
-}
-
-static void tcp_receive_task(void *pvParameters)
-{
-    uint8_t *rx_buffer = (uint8_t *) malloc(UART_BUF_SIZE);
-    if (!rx_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate memory for receive buffer");
-        vTaskDelete(NULL);
-    }
-
-    // Accumulation buffer for framed messages (enlarged for prefix)
-    static uint8_t recv_accum[2048 + FRAME_PREFIX_LEN];
-    static size_t accum_len = 0;
-    static uint32_t last_data_time = 0;
-
-    uint8_t line_buf[UART_BUF_SIZE];
-
-    while (1) {
-        if (!get_tcp_connected() || tcp_sock == -1) {
-            // Clear accumulation on disconnect
-            accum_len = 0;
-            vTaskDelay(100 / portTICK_PERIOD_MS);  // Reduced from 500ms, but not too aggressive
-            esp_task_wdt_reset();  // 喂狗
-            continue;
-        }
-
-        int len = recv(tcp_sock, rx_buffer, UART_BUF_SIZE - 1, 0);
-        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        if (len > 0) {
-            last_data_time = now;
-
-            // Append to accumulation buffer
-            if (accum_len + len > sizeof(recv_accum)) {
-                ESP_LOGE(TAG, "Recv accumulation overflow (%zu + %d > %zu), resetting", accum_len, len, sizeof(recv_accum));
-                accum_len = 0;
-            }
-            memcpy(recv_accum + accum_len, rx_buffer, len);
-            accum_len += len;
-
-            // Prioritize length-prefixed frames (for data)
-            while (accum_len >= FRAME_PREFIX_LEN) {
-                uint32_t frame_len = read_be32(recv_accum);
-                size_t total_frame_len = FRAME_PREFIX_LEN + frame_len;
-                if (frame_len > MAX_FRAME_LEN || total_frame_len > sizeof(recv_accum)) {
-                    // Invalid length (e.g., commands like "BAUD=" interpret as large number), fallback to \r\n
-                    break;
-                }
-                if (accum_len >= total_frame_len) {
-                    // Complete frame: extract data (skip prefix)
-                    size_t data_len = frame_len;
-                    if (data_len > sizeof(line_buf)) {
-                        ESP_LOGW(TAG, "Frame data too long (%zu), partial process", data_len);
-                        data_len = sizeof(line_buf);
-                    }
-                    memcpy(line_buf, recv_accum + FRAME_PREFIX_LEN, data_len);
-
-                    // Transparent passthrough to UART (data, no parse)
-                    print_raw_data(line_buf, data_len);
-                    if (debug_mode) ESP_LOGI(TAG, "Processed length-framed data: %zu bytes", data_len);
-
-                    // Shift out processed frame
-                    size_t remaining = accum_len - total_frame_len;
-                    memmove(recv_accum, recv_accum + total_frame_len, remaining);
-                    accum_len = remaining;
-                    continue;  // Check for more frames
-                } else {
-                    break;  // Wait for more data
-                }
-            }
-
-            // Fallback: Process \r\n delimited lines (for commands)
-            while (accum_len >= 2) {
-                uint8_t *nl_pos = find_rn(recv_accum, accum_len);
-                if (!nl_pos) {
-                    break;  // No complete line
-                }
-
-                size_t line_len = nl_pos - recv_accum;
-                if (line_len == 0) {
-                    // Empty line, skip
-                    memmove(recv_accum, nl_pos + 2, accum_len - 2);
-                    accum_len -= 2;
-                    continue;
-                }
-
-                // Extract line (exclude \r\n)
-                if (line_len >= sizeof(line_buf)) {
-                    ESP_LOGW(TAG, "Line too long (%zu bytes), skipping", line_len);
-                    // Shift out the line + delimiter
-                    size_t to_shift = line_len + 2;
-                    memmove(recv_accum, nl_pos + 2, accum_len - to_shift);
-                    accum_len -= to_shift;
-                    continue;
-                }
-                memcpy(line_buf, recv_accum, line_len);
-
-                // 优化 debug hex log：len > 128 时仅摘要，避免慢循环
-                if (debug_mode && line_len <= 128) {
-                    char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};  // +1 for null
-                    char *ptr = hex_buf;
-                    for (int i = 0; i < (int)line_len; i++) {
-                        ptr += sprintf(ptr, "%02X ", line_buf[i]);  // sprintf 直接追加，无 strlen
-                    }
-                    ESP_LOGI(TAG, "Raw TCP line buffer (hex): %s (length: %zu)", hex_buf, line_len);
-                } else if (debug_mode) {
-                    ESP_LOGI(TAG, "TCP line received: %zu bytes (hex log skipped)", line_len);
-                }
-
-                // Parse and process the received line
-                esp_err_t result = parse_tcp_command(tcp_sock, line_buf, line_len);
-                if (result != ESP_OK) {
-                    ESP_LOGW(TAG, "Failed to parse TCP line (len=%zu)", line_len);
-                }
-
-                // Shift remaining data
-                size_t remaining = accum_len - (line_len + 2);
-                memmove(recv_accum, nl_pos + 2, remaining);
-                accum_len = remaining;
-            }
-        } else if (len < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                vTaskDelay(1 / portTICK_PERIOD_MS);  // 1ms yield for non-blocking
-                esp_task_wdt_reset();
-                // Check for timeout flush if accum has data
-                goto check_timeout;
-            }
-            // Real disconnect: ECONNRESET, ETIMEDOUT, etc.
-            ESP_LOGW(TAG, "TCP disconnect detected: errno %d, initiating backoff reconnect...", errno);
-            set_tcp_connected(false);
-            close(tcp_sock);
-            tcp_sock = -1;
-            gpio_set_level(LED_PIN, 1); // LED off on disconnect
-            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            last_reconnect_time = now;
-            tcp_reconnect_delay_ms = TCP_RETRY_BASE_DELAY_MS;  // Reset backoff on new disconnect
-            accum_len = 0;  // Clear on disconnect
-            vTaskDelay(tcp_reconnect_delay_ms / portTICK_PERIOD_MS);
-            tcp_reconnect_delay_ms = (tcp_reconnect_delay_ms * 2 > TCP_RETRY_MAX_DELAY_MS) ? TCP_RETRY_MAX_DELAY_MS : tcp_reconnect_delay_ms * 2;
-            esp_task_wdt_reset();
-            continue;
-        } else if (len == 0) {
-            ESP_LOGI(TAG, "TCP connection closed by peer, initiating backoff reconnect...");
-            set_tcp_connected(false);
-            close(tcp_sock);
-            tcp_sock = -1;
-            gpio_set_level(LED_PIN, 1); // LED off on disconnect
-            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            last_reconnect_time = now;
-            tcp_reconnect_delay_ms = TCP_RETRY_BASE_DELAY_MS;  // Reset backoff
-            accum_len = 0;  // Clear on disconnect
-            vTaskDelay(tcp_reconnect_delay_ms / portTICK_PERIOD_MS);
-            tcp_reconnect_delay_ms = (tcp_reconnect_delay_ms * 2 > TCP_RETRY_MAX_DELAY_MS) ? TCP_RETRY_MAX_DELAY_MS : tcp_reconnect_delay_ms * 2;
-            esp_task_wdt_reset();
-            continue;
-        }
-
-check_timeout:
-        // Timeout-based flush for unframed data (no \r\n, fallback after prefix check)
-        if (accum_len > 0) {
-            if ((now - last_data_time > FRAME_TIMEOUT_MS) || (accum_len >= MAX_ACCUM_LEN)) {
-                if (debug_mode) {
-                    ESP_LOGI(TAG, "Flushing accum on timeout/size (%zu bytes, idle %ums)", accum_len, now - last_data_time);
-                }
-                if (accum_len <= sizeof(line_buf)) {
-                    memcpy(line_buf, recv_accum, accum_len);
-
-                    // 优化 debug hex log：len > 128 时仅摘要，避免慢循环
-                    if (debug_mode && accum_len <= 128) {
-                        char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};  // +1 for null
-                        char *ptr = hex_buf;
-                        for (int i = 0; i < (int)accum_len; i++) {
-                            ptr += sprintf(ptr, "%02X ", line_buf[i]);  // sprintf 直接追加，无 strlen
-                        }
-                        ESP_LOGI(TAG, "Raw TCP accum flush (hex): %s (length: %zu)", hex_buf, accum_len);
-                    } else if (debug_mode) {
-                        ESP_LOGI(TAG, "TCP accum flushed: %zu bytes (hex log skipped)", accum_len);
-                    }
-
-                    // Parse and process the accumulated data
-                    esp_err_t result = parse_tcp_command(tcp_sock, line_buf, accum_len);
-                    if (result != ESP_OK) {
-                        ESP_LOGW(TAG, "Failed to parse TCP accum (len=%zu)", accum_len);
-                    }
-
-                    accum_len = 0;
-                } else {
-                    ESP_LOGE(TAG, "Accum too large %zu, dropping", accum_len);
-                    accum_len = 0;
-                }
-            }
-        }
-
-        esp_task_wdt_reset();  // 每循环喂狗
-    }
-
-    free(rx_buffer);
-    vTaskDelete(NULL);
-}
-
-// UDP discovery task - broadcasts for gateway IP, listens for response
-static void udp_discovery_task(void *pvParameters)
-{
-    char rx_buffer[128];
-    struct sockaddr_in dest_addr, src_addr;
-    socklen_t socklen = sizeof(src_addr);
-    int retry = 0;
-    bool discovered = false;
-
-    // Create UDP socket
-    udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (udp_sock < 0) {
-        ESP_LOGE(TAG, "Unable to create UDP socket: errno %d", errno);
-        vTaskDelete(NULL);
-    }
-
-    // Enable broadcast
-    int broadcast = 1;
-    if (setsockopt(udp_sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast)) < 0) {
-        ESP_LOGE(TAG, "Unable to set broadcast: errno %d", errno);
-        close(udp_sock);
-        udp_sock = -1;
-        vTaskDelete(NULL);
-    }
-
-    // Bind to UDP port for listening
-    memset(&src_addr, 0, sizeof(src_addr));
-    src_addr.sin_family = AF_INET;
-    src_addr.sin_port = htons(UDP_PORT);
-    src_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(udp_sock, (struct sockaddr *)&src_addr, sizeof(src_addr)) < 0) {
-        ESP_LOGE(TAG, "Unable to bind UDP socket: errno %d", errno);
-        close(udp_sock);
-        udp_sock = -1;
-        vTaskDelete(NULL);
-    }
-
-    while (!discovered && retry < UDP_DISCOVERY_RETRIES) {
-        if (!is_wifi_connected()) {
-            ESP_LOGW(TAG, "WiFi not connected, delaying discovery");
-            vTaskDelay(500 / portTICK_PERIOD_MS);  // Reduced delay
-            continue;
-        }
-
-        // Broadcast discovery message
-        memset(&dest_addr, 0, sizeof(dest_addr));
-        dest_addr.sin_family = AF_INET;
-        dest_addr.sin_port = htons(UDP_PORT);
-        dest_addr.sin_addr.s_addr = inet_addr(UDP_BROADCAST_ADDR);
-        int sent = sendto(udp_sock, UDP_DISCOVER_MSG, strlen(UDP_DISCOVER_MSG), 0,
-                          (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-        if (sent < 0) {
-            ESP_LOGE(TAG, "UDP broadcast failed: errno %d", errno);
-        } else {
-            if (debug_mode) ESP_LOGI(TAG, "Broadcasted discovery message (attempt %d/%d)", retry + 1, UDP_DISCOVERY_RETRIES);
-        }
-
-        // Listen for response with timeout
-        struct timeval timeout;
-        timeout.tv_sec = UDP_DISCOVERY_TIMEOUT_MS / 1000;
-        timeout.tv_usec = (UDP_DISCOVERY_TIMEOUT_MS % 1000) * 1000;
-        setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-        int len = recvfrom(udp_sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
-                           (struct sockaddr *)&src_addr, &socklen);
-        if (len > 0) {
-            rx_buffer[len] = '\0';
-            if (debug_mode) ESP_LOGI(TAG, "Received UDP response: %s", rx_buffer);
-
-            // Parse "GATEWAY_IP:<ip>\r\n"
-            if (strncmp(rx_buffer, UDP_GATEWAY_RESP_PREFIX, strlen(UDP_GATEWAY_RESP_PREFIX)) == 0) {
-                char *ip_start = rx_buffer + strlen(UDP_GATEWAY_RESP_PREFIX);
-                char *ip_end = strchr(ip_start, '\r');
-                if (ip_end) *ip_end = '\0';
-                if (strlen(ip_start) > 0 && strlen(ip_start) <= 15) {
-                    strlcpy(gateway_ip_addr, ip_start, sizeof(gateway_ip_addr));
-                    gateway_ip_discovered = true;
-                    discovered = true;
-                    needs_rediscovery = false;  // Cache success
-                    ESP_LOGI(TAG, "Discovered gateway IP: %s", gateway_ip_addr);
-                }
-            }
-        } else {
-            ESP_LOGW(TAG, "No UDP response (attempt %d/%d)", retry + 1, UDP_DISCOVERY_RETRIES);
-        }
-
-        retry++;
-        if (!discovered) vTaskDelay(UDP_DISCOVERY_TIMEOUT_MS / portTICK_PERIOD_MS);
-    }
-
-    if (!discovered) {
-        ESP_LOGE(TAG, "Gateway discovery failed after %d retries", UDP_DISCOVERY_RETRIES);
-        // Fallback: Use last known or hardcoded if needed
-        if (gateway_ip_addr[0] != '\0') {
-            ESP_LOGW(TAG, "Using cached gateway IP: %s", gateway_ip_addr);
-            gateway_ip_discovered = true;
-            needs_rediscovery = false;
-        }
-    }
-
-    // Close UDP socket after discovery
-    if (udp_sock >= 0) {
-        close(udp_sock);
-        udp_sock = -1;
-    }
-
-    vTaskDelete(NULL);
-}
-
-/* Centralized TCP connect function */
 static esp_err_t tcp_connect(void) {
     if (!gateway_ip_discovered || tcp_sock != -1) {
         return ESP_FAIL;
     }
-
     struct sockaddr_in dest_addr;
     dest_addr.sin_addr.s_addr = inet_addr(gateway_ip_addr);
     dest_addr.sin_family = AF_INET;
     dest_addr.sin_port = htons(TCP_PORT);
-
     tcp_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     if (tcp_sock < 0) {
         ESP_LOGE(TAG, "Unable to create TCP socket: errno %d", errno);
         return ESP_FAIL;
     }
-
     struct timeval timeout;
     timeout.tv_sec = TCP_CONNECT_TIMEOUT_MS / 1000;
     timeout.tv_usec = (TCP_CONNECT_TIMEOUT_MS % 1000) * 1000;
     setsockopt(tcp_sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     setsockopt(tcp_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
     // Enhanced keepalive: Shorter idle (5s) with fewer probes (3) for ~8s detection
     int keepalive = 1;
-    int keepidle = 5;      // 5s idle before probes
-    int keepintvl = 1;     // 1s between probes
-    int keepcnt = 3;       // 3 probes
+    int keepidle = 5; // 5s idle before probes
+    int keepintvl = 1; // 1s between probes
+    int keepcnt = 3; // 3 probes
     setsockopt(tcp_sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
     setsockopt(tcp_sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
     setsockopt(tcp_sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
     setsockopt(tcp_sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
     ESP_LOGI(TAG, "TCP Keepalive optimized: idle=5s, probes=3x1s (total ~8s detection)");
-
     // Disable Nagle's algorithm for real-time small-packet sending
     int nodelay = 1;
     setsockopt(tcp_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
     ESP_LOGI(TAG, "TCP_NODELAY enabled for real-time sending");
-
     // Set larger TCP send buffer (64kB)
-    int send_buf_size = 65536;  // 64kB
+    int send_buf_size = 65536; // 64kB
     setsockopt(tcp_sock, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size));
     if (debug_mode) ESP_LOGI(TAG, "Set TCP SO_SNDBUF to 64kB");
-
     int err = connect(tcp_sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
     if (err != 0) {
         ESP_LOGW(TAG, "TCP unable to connect to %s:%d: errno %d", gateway_ip_addr, TCP_PORT, errno);
@@ -1001,7 +558,6 @@ static esp_err_t tcp_connect(void) {
         tcp_sock = -1;
         return ESP_FAIL;
     }
-
     // Set non-blocking after connect
     int flags = fcntl(tcp_sock, F_GETFL, 0);
     if (flags >= 0 && fcntl(tcp_sock, F_SETFL, flags | O_NONBLOCK) < 0) {
@@ -1010,165 +566,45 @@ static esp_err_t tcp_connect(void) {
         tcp_sock = -1;
         return ESP_FAIL;
     }
-
-    // Send my IP to gateway after connect
-    send_my_ip(tcp_sock);
-
     ESP_LOGI(TAG, "Successfully connected to gateway %s:%d (backoff reset)", gateway_ip_addr, TCP_PORT);
     set_tcp_connected(true);
-    tcp_reconnect_delay_ms = TCP_RETRY_BASE_DELAY_MS;  // Reset backoff on success
+    tcp_reconnect_delay_ms = TCP_RETRY_BASE_DELAY_MS; // Reset backoff on success
     gpio_set_level(LED_PIN, 0); // LED on (active-low) on TCP connect
     return ESP_OK;
 }
-
-
-/* UART command and TCP bridge task - Enhanced with atomic prefix send */
+/* UART to TCP bridge task - Now uses protocol frames */
 static void uart_tcp_bridge_task(void *pvParameters)
 {
     uint8_t *uart_data = (uint8_t *) malloc(UART_BUF_SIZE);
-    char *rx_buffer = (char *) malloc(UART_BUF_SIZE);
-
-    if (!uart_data || !rx_buffer) {
+    if (!uart_data) {
         ESP_LOGE(TAG, "Failed to allocate memory for buffers");
         vTaskDelete(NULL);
     }
-
-    uint8_t uart_batch[UART_BUF_SIZE];  // Small batch buffer for real-time
+    uint8_t uart_batch[UART_BUF_SIZE]; // Small batch buffer for real-time
     size_t batch_len = 0;
-    uint32_t last_flush = 0;  // For periodic flush
-
-    /* 部分帧状态机变量 */
-    bool sending_partial = false;
-    size_t data_sent_for_current_frame = 0;
-    uint32_t current_frame_data_len = 0;
-    bool tcp_ok;  /* 提前声明 tcp_ok，避免标签后声明 */
-
+    uint32_t last_flush = 0; // For periodic flush
     while (1) {
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-
-        /* 如果部分发送中，暂停 UART 读取（backpressure），仅重试发送剩余 */
-        if (sending_partial) {
-            /* 检查超时：100ms 未完成，放弃帧，断开重连 */
-            if (now - last_flush > 100) {
-                ESP_LOGW(TAG, "Partial frame timeout after 100ms, dropping %zu bytes, reconnecting", batch_len);
-                sending_partial = false;
-                data_sent_for_current_frame = 0;
-                current_frame_data_len = 0;
-                batch_len = 0;
-                set_tcp_connected(false);
-                if (tcp_sock != -1) {
-                    close(tcp_sock);
-                    tcp_sock = -1;
-                }
-                gpio_set_level(LED_PIN, 1); // LED off
-            } else if (batch_len > 0 && (now - last_flush >= FLUSH_INTERVAL_MS)) {
-                /* 重试发送剩余（无前缀，仅 raw 数据） */
-                goto do_flush;
-            } else {
-                vTaskDelay(1 / portTICK_PERIOD_MS);  // 最小 yield
-            }
-            goto check_connect;  // 跳过正常读取和连接检查
-        }
-
-        /* 正常路径：实时读取 UART (短超时 ~1ms) */
+        /* 实时读取 UART (短超时 ~1ms) */
         int len = uart_read_bytes(UART_NUM_0, uart_batch + batch_len, sizeof(uart_batch) - batch_len - 1, UART_READ_TIMEOUT_MS / portTICK_PERIOD_MS);
         if (len > 0) {
             batch_len += len;
-            last_flush = now;  // 更新时间戳，避免误判空闲
+            last_flush = now; // 更新时间戳，避免误判空闲
         }
-
         /* 检查 flush 条件：批次满或 5ms 超时 */
         if (batch_len >= FLUSH_BATCH_SIZE || (now - last_flush >= FLUSH_INTERVAL_MS)) {
-do_flush:    /* 标签：从暂停路径跳转重试 */
-            tcp_ok = get_tcp_connected();  /* 赋值到提前声明的 tcp_ok */
+            bool tcp_ok = get_tcp_connected();
             if (tcp_sock != -1 && tcp_ok && batch_len > 0) {
-                size_t this_payload_len = 0;
-                const char *this_payload = NULL;
-                bool send_prefix = !sending_partial;  // 新帧才加前缀
-
-                if (send_prefix) {
-                    /* 新帧：检查大小并添加长度前缀 */
-                    if (batch_len > MAX_FRAME_LEN) {
-                        ESP_LOGE(TAG, "Batch too large for framing: %zu > %u, dropping", batch_len, MAX_FRAME_LEN);
-                        batch_len = 0;
-                        goto flush_done;
-                    }
-                    uint8_t framed_batch[UART_BUF_SIZE + FRAME_PREFIX_LEN];  // 临时缓冲
-                    write_be32(framed_batch, (uint32_t)batch_len);  // BE uint32 长度
-                    memcpy(framed_batch + FRAME_PREFIX_LEN, uart_batch, batch_len);
-                    // 原子发送前缀（高重试，直到完整）
-                    int prefix_sent = nonblocking_send(tcp_sock, (const char*)framed_batch, FRAME_PREFIX_LEN, 200);
-                    if (prefix_sent < FRAME_PREFIX_LEN) {
-                        ESP_LOGW(TAG, "Prefix incomplete: %d/%d, dropping frame", prefix_sent, FRAME_PREFIX_LEN);
-                        batch_len = 0;
-                        goto flush_done;
-                    }
-                    if (debug_mode) ESP_LOGI(TAG, "Sent prefix: %d bytes (len=%u)", FRAME_PREFIX_LEN, (uint32_t)batch_len);
-                    // 现在只发送数据部分
-                    this_payload = (const char*)(framed_batch + FRAME_PREFIX_LEN);
-                    this_payload_len = batch_len;
-                    current_frame_data_len = batch_len;  // 记录数据部分长度
-                    data_sent_for_current_frame = 0;
-                } else {
-                    /* 继续部分帧：仅发送剩余 raw 数据（无前缀） */
-                    this_payload = (const char*)uart_batch;
-                    this_payload_len = batch_len;
-                }
-
-                /* 非阻塞发送（数据部分） */
-                int sent = nonblocking_send(tcp_sock, this_payload, this_payload_len, 100);  // 100 次重试 ~100ms
-                if (sent < 0) {
-                    /* 致命错误：断开 */
-                    ESP_LOGW(TAG, "Fatal send error during %s, closing socket (len=%zu)", 
-                             send_prefix ? "data" : "partial retry", this_payload_len);
-                    set_tcp_connected(false);
-                    if (tcp_sock != -1) {
-                        close(tcp_sock);
-                        tcp_sock = -1;
-                    }
-                    gpio_set_level(LED_PIN, 1); // LED off
-                    sending_partial = false;
-                    data_sent_for_current_frame = 0;
-                    current_frame_data_len = 0;
-                    batch_len = 0;
-                    goto flush_done;
-                }
-
-                /* 计算本次数据部分发送量 */
-                size_t data_sent_this = (size_t)sent;
-                data_sent_for_current_frame += data_sent_this;
-
-                if (data_sent_for_current_frame >= current_frame_data_len) {
-                    /* 帧完整发送成功 */
-                    if (debug_mode) ESP_LOGI(TAG, "Flushed complete frame: %u bytes data (total sent: %d + %d)", 
-                                             current_frame_data_len, FRAME_PREFIX_LEN, (int)data_sent_for_current_frame);
-                    sending_partial = false;
-                    data_sent_for_current_frame = 0;
-                    current_frame_data_len = 0;
-                    batch_len = 0;
-                } else {
-                    /* 部分发送：更新剩余，进入暂停状态 */
-                    size_t remaining_data = current_frame_data_len - data_sent_for_current_frame;
-                    /* 移动缓冲区剩余数据（raw） */
-                    memmove(uart_batch, uart_batch + data_sent_this, remaining_data);
-                    batch_len = remaining_data;
-                    sending_partial = true;
-                    ESP_LOGW(TAG, "Partial data send: %zu/%u sent, remaining %zu (retry in %dms)", 
-                             data_sent_for_current_frame, current_frame_data_len, batch_len, FLUSH_INTERVAL_MS);
-                }
+                // Send as data frame
+                build_and_send_frame(tcp_sock, 0x00, out_seq++, uart_batch, batch_len);
+                batch_len = 0;
             } else if (!tcp_ok || tcp_sock == -1) {
                 /* TCP 未连：丢弃批次 */
                 ESP_LOGE(TAG, "TCP not connected, dropping batched data (len=%zu)", (unsigned)batch_len);
-                sending_partial = false;
-                data_sent_for_current_frame = 0;
-                current_frame_data_len = 0;
                 batch_len = 0;
             }
-flush_done:
-            last_flush = now;  // 更新时间戳
+            last_flush = now; // 更新时间戳
         }
-
-check_connect:
         /* 原 WiFi/TCP 连接逻辑（无变化） */
         if (!is_wifi_connected()) {
             if (debug_mode) ESP_LOGW(TAG, "WiFi not connected, closing socket");
@@ -1177,28 +613,23 @@ check_connect:
                 tcp_sock = -1;
                 set_tcp_connected(false);
             }
-            my_ip_addr[0] = '\0';  // Invalidate IP
-            needs_rediscovery = true;  // Trigger rediscovery on reconnect
+            needs_rediscovery = true; // Trigger rediscovery on reconnect
             gateway_ip_discovered = false;
-            sending_partial = false;  // 重置状态
-            data_sent_for_current_frame = 0;
-            current_frame_data_len = 0;
-            batch_len = 0;  // Clear batch on disconnect
+            batch_len = 0; // Clear batch on disconnect
             vTaskDelay(1000 / portTICK_PERIOD_MS);
             esp_task_wdt_reset();
             continue;
         }
-
         // Attempt TCP connect only if needed and gateway known
-        tcp_ok = get_tcp_connected();  /* 使用提前声明的 tcp_ok */
+        bool tcp_ok = get_tcp_connected();
         if (tcp_ok && tcp_sock != -1) {
             // Connection healthy, quick check
-            vTaskDelay(1 / portTICK_PERIOD_MS);  // Minimal yield
+            vTaskDelay(1 / portTICK_PERIOD_MS); // Minimal yield
         } else if (needs_rediscovery) {
             // Trigger discovery if needed
             xTaskCreate(udp_discovery_task, "udp_discovery", 4096, NULL, 5, NULL);
-            needs_rediscovery = false;  // Prevent spam
-            vTaskDelay(500 / portTICK_PERIOD_MS);  // Wait for discovery
+            needs_rediscovery = false; // Prevent spam
+            vTaskDelay(500 / portTICK_PERIOD_MS); // Wait for discovery
         } else if (gateway_ip_discovered && tcp_sock == -1) {
             uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
             if (now - last_reconnect_time >= tcp_reconnect_delay_ms) {
@@ -1212,19 +643,481 @@ check_connect:
                 vTaskDelay(100 / portTICK_PERIOD_MS);
             }
         } else {
-            vTaskDelay(1000 / portTICK_PERIOD_MS);  // No gateway, longer wait
+            vTaskDelay(1000 / portTICK_PERIOD_MS); // No gateway, longer wait
         }
-
-        esp_task_wdt_reset();  // 每循环喂狗
+        esp_task_wdt_reset(); // 每循环喂狗
     }
-
     if (tcp_sock != -1) {
         close(tcp_sock);
         tcp_sock = -1;
         set_tcp_connected(false);
     }
     free(uart_data);
-    free(rx_buffer);
+    vTaskDelete(NULL);
+}
+
+// Additions to station_example_main.c
+// Place these at the top of the file, after includes, before any functions.
+// These provide the missing enums and helper functions from the protocol.
+
+// Enums from protocol (add near other defines)
+enum frame_type {
+    FRAME_TYPE_DATA = 0x00,    // Passthrough
+    FRAME_TYPE_CMD = 0x01,     // Command
+    FRAME_TYPE_RESP = 0x02,    // ACK/NAK
+    FRAME_TYPE_HEARTBEAT = 0x03
+};
+
+enum result_code {
+    RESULT_OK = 0x00,          // Success
+    RESULT_UNKNOWN_CMD = 0x01, // Unknown command
+    RESULT_PARAM_ERR = 0x02,   // Param error
+    RESULT_EXEC_FAIL = 0x03,   // Exec fail
+    RESULT_CRC_ERR = 0x04      // CRC error
+};
+
+// Helper: Manual find FF FF header (ESP8266 compatible, no memmem)
+static const uint8_t *find_header(const uint8_t *buf, size_t len) {
+    for (size_t i = 0; i + 1 < len; i++) {
+        if (buf[i] == 0xFF && buf[i + 1] == 0xFF) {
+            return buf + i;
+        }
+    }
+    return NULL;
+}
+
+// Byte unescape (symmetric to server's escape_data)
+static size_t unescape_data(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_max) {
+    if (!in || in_len == 0 || !out || out_max < in_len) return 0;
+    size_t out_idx = 0;
+    size_t i = 0;
+    while (i < in_len) {
+        uint8_t b = in[i++];
+        if (out_idx >= out_max) return 0;  // Overflow
+        if (b == 0xFE) {
+            if (i >= in_len) return 0;  // Incomplete escape
+            uint8_t next = in[i++];
+            if (next == 0xDF) {
+                b = 0xFF;
+            } else if (next == 0xDE) {
+                b = 0xFE;
+            } else {
+                // Invalid escape sequence; treat FE as literal
+                out[out_idx++] = 0xFE;
+                b = next;  // Process next as normal
+            }
+        }
+        out[out_idx++] = b;
+    }
+    return out_idx;
+}
+
+// Forward declare send_response_frame (before tcp_receive_task)
+static esp_err_t send_response_frame(uint16_t seq, uint8_t type, uint8_t tag, uint8_t result, const uint8_t *resp_data, size_t data_len);
+
+// Updated tcp_receive_task with progressive unescaping for correct parsing, additional diagnostic logging for raw data and parsing results
+// Fixed bug: Previously assumed fixed positions without unescaping shifts; now unescapes progressively to parse len, then full frame.
+// Added raw hex dump on every recv (limited to 128B to avoid flood), and detailed parsing logs.
+// Set debug_mode=1 by default in app_main for testing.
+
+static void tcp_receive_task(void *pvParameters)
+{
+    const char *TAG = "tcp_receive";
+    uint8_t recv_buf[MAX_RAW_ACCUM];  // Buffer for raw TCP data (with escapes)
+    int recv_len = 0;
+    uint16_t last_seq = 0x0000;  // Track last processed seq to detect duplicates (simple)
+
+    // Diagnostic: Log task start
+    ESP_LOGI(TAG, "tcp_receive_task started (debug_mode=%u)", debug_mode);
+
+    while (1) {
+        if (!get_tcp_connected() || tcp_sock < 0) {
+            // Diagnostic: Log disconnect state
+            if (debug_mode) ESP_LOGD(TAG, "Task idle: not connected (tcp_sock=%d)", tcp_sock);
+            vTaskDelay(pdMS_TO_TICKS(100));  // Backoff if not connected
+            continue;
+        }
+
+        // Non-blocking recv (timeout 1ms for real-time)
+        struct timeval tv = {0, 1000};  // 1ms
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(tcp_sock, &readfds);
+        int sel = select(tcp_sock + 1, &readfds, NULL, NULL, &tv);
+        if (sel <= 0) {
+            continue;  // No data or error (common in idle)
+        }
+
+        // Read available data
+        recv_len = recv(tcp_sock, recv_buf, sizeof(recv_buf), 0);
+        if (recv_len <= 0) {
+            if (recv_len < 0) {
+                ESP_LOGE(TAG, "TCP recv error: %d (%s)", errno, strerror(errno));
+            } else {
+                ESP_LOGW(TAG, "TCP recv returned 0 (peer closed?)");
+            }
+            // On error or EOF, close and flag disconnect
+            close(tcp_sock);
+            tcp_sock = -1;
+            set_tcp_connected(false);
+            needs_rediscovery = true;  // Trigger reconnect
+            continue;
+        }
+
+        // Diagnostic: Log every recv with raw hex dump (limit to first 128B to avoid flood)
+        if (debug_mode) {
+            ESP_LOGI(TAG, "TCP recv: %d bytes (first: %02X %02X ...)", recv_len, recv_buf[0], (recv_len > 1 ? recv_buf[1] : 0));
+            // Hex dump of raw data
+            char hex_buf[3 * 128 + 1] = {0};
+            size_t hex_idx = 0;
+            size_t dump_len = (recv_len > 128) ? 128 : (size_t)recv_len;
+            for (size_t i = 0; i < dump_len; ++i) {
+                hex_idx += snprintf(hex_buf + hex_idx, sizeof(hex_buf) - hex_idx, "%02X ", recv_buf[i]);
+                if ((i + 1) % 16 == 0 || i == dump_len - 1) {
+                    ESP_LOGI(TAG, "Raw recv hex: %s", hex_buf);
+                    hex_idx = 0;
+                    memset(hex_buf, 0, sizeof(hex_buf));
+                }
+            }
+            if (recv_len > 128) {
+                ESP_LOGI(TAG, "Raw recv: ... (truncated at 128B, total %dB)", recv_len);
+            }
+        }
+
+        // Process the received buffer for frames (multi-frame possible)
+        size_t pos = 0;
+        while (pos < (size_t)recv_len) {
+            // Find next frame header (FF FF)
+            const uint8_t *frame_start = find_header(recv_buf + pos, recv_len - pos);
+            if (!frame_start) {
+                // Diagnostic: No header found
+                if (debug_mode) ESP_LOGD(TAG, "No FF FF header from pos=%zu (remaining=%zu bytes)", pos, recv_len - pos);
+                // No more frames; shift remaining partial data to front if any
+                if (pos > 0) {
+                    memmove(recv_buf, recv_buf + pos, recv_len - pos);
+                    recv_len -= pos;
+                }
+                break;  // Exit inner loop
+            }
+
+            size_t header_offset = frame_start - (recv_buf + pos);
+            pos += header_offset;  // Advance to header position
+            size_t header_pos = pos;  // Remember for potential shift
+
+            // Diagnostic: Header found
+            if (debug_mode) ESP_LOGI(TAG, "Found header FF FF at pos=%zu", pos);
+
+            // Start progressive unescaping from body (after header)
+            const uint8_t *raw_body_ptr = recv_buf + pos + 2;
+            size_t avail_raw = recv_len - (pos + 2);
+            uint8_t unesc_frame[MAX_FRAME_UNESC + 7];  // type(1)+seq(2)+len(2)+payload(max)+crc(2)
+            size_t unesc_idx = 0;
+            size_t raw_body_consumed = 0;
+
+            // Phase 1: Unescape first 5 bytes (type + seq + len) to parse len
+            bool incomplete = false;
+            while (unesc_idx < 5 && raw_body_consumed < avail_raw) {
+                uint8_t b = raw_body_ptr[raw_body_consumed];
+                raw_body_consumed++;
+                if (b == 0xFE) {
+                    if (raw_body_consumed >= avail_raw) {
+                        incomplete = true;
+                        break;
+                    }
+                    uint8_t next = raw_body_ptr[raw_body_consumed];
+                    raw_body_consumed++;
+                    if (next == 0xDF) {
+                        b = 0xFF;
+                    } else if (next == 0xDE) {
+                        b = 0xFE;
+                    } else {
+                        // Invalid: treat as literal FE + next
+                        unesc_frame[unesc_idx++] = 0xFE;
+                        b = next;
+                        // Don't increment unesc_idx again
+                    }
+                }
+                if (unesc_idx < sizeof(unesc_frame)) {
+                    unesc_frame[unesc_idx++] = b;
+                } else {
+                    incomplete = true;
+                    break;
+                }
+            }
+
+            if (incomplete || unesc_idx < 5) {
+                if (debug_mode) ESP_LOGD(TAG, "Incomplete fixed header (unesc=%zu/5, raw_consumed=%zu/%zu)", unesc_idx, raw_body_consumed, avail_raw);
+                // Shift buffer to keep header + partial body
+                memmove(recv_buf, recv_buf + header_pos, recv_len - header_pos);
+                recv_len -= header_pos;
+                break;
+            }
+
+            // Parse fixed fields from unescaped
+            uint8_t type = unesc_frame[0];
+            uint16_t seq = (unesc_frame[1] << 8) | unesc_frame[2];
+            uint16_t pay_len = (unesc_frame[3] << 8) | unesc_frame[4];
+
+            // Diagnostic: Log parsed fixed fields
+            if (debug_mode) ESP_LOGI(TAG, "Parsed fixed: type=0x%02X, seq=0x%04X, pay_len=%u (raw_body_consumed for fixed=%zu)", type, seq, pay_len, raw_body_consumed);
+
+            // Validate pay_len
+            if (pay_len > MAX_FRAME_UNESC - 7) {
+                ESP_LOGE(TAG, "Invalid pay_len %u for Seq=0x%04X - too large", pay_len, seq);
+                // Skip this frame: advance past header + consumed raw
+                pos += 2 + raw_body_consumed;
+                continue;
+            }
+
+            // Phase 2: Unescape remaining pay_len + 2 (payload + CRC)
+            size_t remaining_unesc_needed = pay_len + 2;
+            while (unesc_idx < 5 + remaining_unesc_needed && raw_body_consumed < avail_raw) {
+                uint8_t b = raw_body_ptr[raw_body_consumed];
+                raw_body_consumed++;
+                if (b == 0xFE) {
+                    if (raw_body_consumed >= avail_raw) {
+                        incomplete = true;
+                        break;
+                    }
+                    uint8_t next = raw_body_ptr[raw_body_consumed];
+                    raw_body_consumed++;
+                    if (next == 0xDF) {
+                        b = 0xFF;
+                    } else if (next == 0xDE) {
+                        b = 0xFE;
+                    } else {
+                        unesc_frame[unesc_idx++] = 0xFE;  // Already incremented? No, append FE
+                        b = next;
+                    }
+                }
+                if (unesc_idx < sizeof(unesc_frame)) {
+                    unesc_frame[unesc_idx++] = b;
+                } else {
+                    incomplete = true;
+                    break;
+                }
+            }
+
+            if (incomplete || unesc_idx < 5 + remaining_unesc_needed) {
+                if (debug_mode) ESP_LOGD(TAG, "Incomplete full frame (unesc=%zu/%zu, raw_consumed=%zu/%zu)", unesc_idx, 5 + remaining_unesc_needed, raw_body_consumed, avail_raw);
+                // Shift to keep header + partial
+                memmove(recv_buf, recv_buf + header_pos, recv_len - header_pos);
+                recv_len -= header_pos;
+                break;
+            }
+
+            // Now full unescaped frame in unesc_frame[0..5+pay_len+1]
+            const uint8_t *unesc_payload = unesc_frame + 5;
+            uint16_t computed_crc = crc16_ccitt(unesc_frame, 5 + pay_len);
+            uint16_t recv_crc = (unesc_frame[5 + pay_len] << 8) | unesc_frame[5 + pay_len + 1];
+
+            // Diagnostic: Log CRC details
+            if (debug_mode) ESP_LOGI(TAG, "CRC check: computed=0x%04X, received=0x%04X (Seq=0x%04X, total raw body consumed=%zu)", computed_crc, recv_crc, seq, raw_body_consumed);
+
+            if (computed_crc != recv_crc) {
+                ESP_LOGE(TAG, "CRC mismatch for Seq=0x%04X: computed=0x%04X != recv=0x%04X - dropping frame", seq, computed_crc, recv_crc);
+                // Skip bad frame
+                pos += 2 + raw_body_consumed;
+                continue;
+            }
+
+            // Duplicate seq check (simple: ignore if matches last)
+            if (seq == last_seq && type != FRAME_TYPE_RESP) {  // Resp may repeat for ACK
+                ESP_LOGW(TAG, "Duplicate seq 0x%04X ignored", seq);
+                pos += 2 + raw_body_consumed;
+                continue;
+            }
+            last_seq = seq;
+
+            // Diagnostic: Log successful parse
+            if (debug_mode) ESP_LOGI(TAG, "Frame parsed successfully: type=0x%02X, seq=0x%04X, pay_len=%u, CRC OK", (unsigned int)type, (unsigned int)seq, (unsigned int)pay_len);
+
+            // Dispatch by type
+            switch (type) {
+                case FRAME_TYPE_DATA:  // 0x00: Passthrough data
+                    ESP_LOGI(TAG, ">>> ENTERED FRAME_TYPE_DATA (Seq=0x%04X, pay_len=%u) <<<", seq, pay_len);  // Marker log
+                    if (pay_len > 0) {
+                        // Forward to UART
+                        int uart_sent = uart_write_bytes(UART_NUM_0, (const char *)unesc_payload, pay_len);
+                        if (uart_sent != (int)pay_len) {
+                            ESP_LOGE(TAG, "UART write incomplete: %d / %u", uart_sent, pay_len);
+                        } else {
+                            ESP_LOGI(TAG, "TCP→UART: Forwarded %u bytes passthrough data (Seq=0x%04X)", pay_len, seq);
+                        }
+
+                        // Debug logging for payload content (hex + ASCII preview)
+                        if (debug_mode && pay_len > 0 && pay_len <= 128) {  // Limit to 128B to avoid log flood
+                            // Hex dump (buffered to one log line)
+                            char hex_buf[3 * 128 + 1] = {0};
+                            size_t hex_idx = 0;
+                            for (size_t i = 0; i < pay_len; ++i) {
+                                hex_idx += snprintf(hex_buf + hex_idx, sizeof(hex_buf) - hex_idx, "%02X ", unesc_payload[i]);
+                                if ((i + 1) % 16 == 0 || i == pay_len - 1) {  // Line every 16B
+                                    ESP_LOGI(TAG, "Parsed pay hex: %s", hex_buf);
+                                    hex_idx = 0;
+                                    memset(hex_buf, 0, sizeof(hex_buf));
+                                }
+                            }
+
+                            // ASCII preview (replace non-printable with '.')
+                            char ascii_buf[129] = {0};  // +1 for null
+                            size_t asc_idx = 0;
+                            for (size_t i = 0; i < pay_len && asc_idx < 128; ++i) {
+                                uint8_t b = unesc_payload[i];
+                                ascii_buf[asc_idx++] = (b >= 32 && b <= 126) ? (char)b : '.';
+                            }
+                            ESP_LOGI(TAG, "Parsed pay ASCII: %s", ascii_buf);
+                        } else if (debug_mode && pay_len > 128) {
+                            ESP_LOGI(TAG, "TCP→UART: Large payload %uB (skipped detailed log)", pay_len);
+                        }
+                    } else {
+                        ESP_LOGI(TAG, "TCP→UART: Empty passthrough frame (Seq=0x%04X)", seq);
+                    }
+                    ESP_LOGI(TAG, ">>> EXITED FRAME_TYPE_DATA <<<");  // Marker log
+                    break;
+
+                case FRAME_TYPE_CMD:  // 0x01: Command
+                    ESP_LOGI(TAG, "Received CMD frame (Seq=0x%04X, Payload len=%u)", seq, pay_len);
+                    // TODO: Parse TLV, handle commands (e.g., set baud/WiFi), send response
+                    // For now, send generic ACK
+                    send_response_frame(seq, FRAME_TYPE_RESP, 0x00, RESULT_OK, NULL, 0);  // Example ACK
+                    break;
+
+                case FRAME_TYPE_RESP:  // 0x02: Response (e.g., ACK/NAK from device, but here we receive from server?)
+                    ESP_LOGI(TAG, "Received RESP frame (Seq=0x%04X, len=%u)", seq, pay_len);
+                    // TODO: Handle if needed (e.g., for outgoing ACKs, but typically we send our own)
+                    break;
+
+                case FRAME_TYPE_HEARTBEAT:  // 0x03
+                    ESP_LOGD(TAG, "Received heartbeat (Seq=0x%04X)", seq);
+                    break;
+
+                default:
+                    ESP_LOGW(TAG, "Unknown frame type 0x%02X (Seq=0x%04X)", type, seq);
+                    break;
+            }
+
+            // Advance pos past this full frame (header + raw body consumed)
+            pos += 2 + raw_body_consumed;
+        }  // End while(pos < recv_len)
+    }  // End outer while(1)
+}
+
+// Corrected send_response_frame (now returns esp_err_t, uses build_and_send_frame for consistency)
+static esp_err_t send_response_frame(uint16_t seq, uint8_t type, uint8_t tag, uint8_t result, const uint8_t *resp_data, size_t data_len)
+{
+    // Build payload: Tag + Result + Data
+    uint8_t resp_payload[1 + 1 + MAX_FRAME_UNESC];
+    size_t resp_pl_len = 2;
+    resp_payload[0] = tag;
+    resp_payload[1] = result;
+    if (data_len > 0 && data_len <= MAX_FRAME_UNESC - 2) {
+        memcpy(resp_payload + 2, resp_data, data_len);
+        resp_pl_len += data_len;
+    }
+
+    // Use build_and_send_frame (non-blocking)
+    if (get_tcp_connected() && tcp_sock >= 0) {
+        build_and_send_frame(tcp_sock, type, seq, resp_payload, resp_pl_len);
+        return ESP_OK;
+    }
+    return ESP_FAIL;
+}
+
+// UDP discovery task - broadcasts for gateway IP, listens for response
+static void udp_discovery_task(void *pvParameters)
+{
+    char rx_buffer[128];
+    struct sockaddr_in dest_addr, src_addr;
+    socklen_t socklen = sizeof(src_addr);
+    int retry = 0;
+    bool discovered = false;
+    // Create UDP socket
+    udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (udp_sock < 0) {
+        ESP_LOGE(TAG, "Unable to create UDP socket: errno %d", errno);
+        vTaskDelete(NULL);
+    }
+    // Enable broadcast
+    int broadcast = 1;
+    if (setsockopt(udp_sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast)) < 0) {
+        ESP_LOGE(TAG, "Unable to set broadcast: errno %d", errno);
+        close(udp_sock);
+        udp_sock = -1;
+        vTaskDelete(NULL);
+    }
+    // Bind to UDP port for listening
+    memset(&src_addr, 0, sizeof(src_addr));
+    src_addr.sin_family = AF_INET;
+    src_addr.sin_port = htons(UDP_PORT);
+    src_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(udp_sock, (struct sockaddr *)&src_addr, sizeof(src_addr)) < 0) {
+        ESP_LOGE(TAG, "Unable to bind UDP socket: errno %d", errno);
+        close(udp_sock);
+        udp_sock = -1;
+        vTaskDelete(NULL);
+    }
+    while (!discovered && retry < UDP_DISCOVERY_RETRIES) {
+        if (!is_wifi_connected()) {
+            ESP_LOGW(TAG, "WiFi not connected, delaying discovery");
+            vTaskDelay(500 / portTICK_PERIOD_MS); // Reduced delay
+            continue;
+        }
+        // Broadcast discovery message
+        memset(&dest_addr, 0, sizeof(dest_addr));
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_port = htons(UDP_PORT);
+        dest_addr.sin_addr.s_addr = inet_addr(UDP_BROADCAST_ADDR);
+        int sent = sendto(udp_sock, UDP_DISCOVER_MSG, strlen(UDP_DISCOVER_MSG), 0,
+                          (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        if (sent < 0) {
+            ESP_LOGE(TAG, "UDP broadcast failed: errno %d", errno);
+        } else {
+            if (debug_mode) ESP_LOGI(TAG, "Broadcasted discovery message (attempt %d/%d)", retry + 1, UDP_DISCOVERY_RETRIES);
+        }
+        // Listen for response with timeout
+        struct timeval timeout;
+        timeout.tv_sec = UDP_DISCOVERY_TIMEOUT_MS / 1000;
+        timeout.tv_usec = (UDP_DISCOVERY_TIMEOUT_MS % 1000) * 1000;
+        setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        int len = recvfrom(udp_sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
+                           (struct sockaddr *)&src_addr, &socklen);
+        if (len > 0) {
+            rx_buffer[len] = '\0';
+            if (debug_mode) ESP_LOGI(TAG, "Received UDP response: %s", rx_buffer);
+            // Parse "GATEWAY_IP:<ip>\r\n"
+            if (strncmp(rx_buffer, UDP_GATEWAY_RESP_PREFIX, strlen(UDP_GATEWAY_RESP_PREFIX)) == 0) {
+                char *ip_start = rx_buffer + strlen(UDP_GATEWAY_RESP_PREFIX);
+                char *ip_end = strchr(ip_start, '\r');
+                if (ip_end) *ip_end = '\0';
+                if (strlen(ip_start) > 0 && strlen(ip_start) <= 15) {
+                    strlcpy(gateway_ip_addr, ip_start, sizeof(gateway_ip_addr));
+                    gateway_ip_discovered = true;
+                    discovered = true;
+                    needs_rediscovery = false; // Cache success
+                    ESP_LOGI(TAG, "Discovered gateway IP: %s", gateway_ip_addr);
+                }
+            }
+        } else {
+            ESP_LOGW(TAG, "No UDP response (attempt %d/%d)", retry + 1, UDP_DISCOVERY_RETRIES);
+        }
+        retry++;
+        if (!discovered) vTaskDelay(UDP_DISCOVERY_TIMEOUT_MS / portTICK_PERIOD_MS);
+    }
+    if (!discovered) {
+        ESP_LOGE(TAG, "Gateway discovery failed after %d retries", UDP_DISCOVERY_RETRIES);
+        // Fallback: Use last known or hardcoded if needed
+        if (gateway_ip_addr[0] != '\0') {
+            ESP_LOGW(TAG, "Using cached gateway IP: %s", gateway_ip_addr);
+            gateway_ip_discovered = true;
+            needs_rediscovery = false;
+        }
+    }
+    // Close UDP socket after discovery
+    if (udp_sock >= 0) {
+        close(udp_sock);
+        udp_sock = -1;
+    }
     vTaskDelete(NULL);
 }
 /* Timer callback to reset boot count */
@@ -1249,7 +1142,6 @@ static void boot_count_reset_timer_callback(void *arg)
         ESP_LOGE(TAG, "Failed to open NVS for boot count reset: %s", esp_err_to_name(err));
     }
 }
-
 /* Handle boot count increment and check for factory reset */
 static void handle_boot_count(void)
 {
@@ -1259,14 +1151,12 @@ static void handle_boot_count(void)
         ESP_LOGE(TAG, "Failed to open NVS for boot count: %s", esp_err_to_name(err));
         return;
     }
-
     uint32_t boot_count = 0;
     err = nvs_get_u32(nvs_handle, BOOT_COUNT_KEY, &boot_count);
     if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
         nvs_close(nvs_handle);
         return;
     }
-
     boot_count++;
     err = nvs_set_u32(nvs_handle, BOOT_COUNT_KEY, boot_count);
     if (err != ESP_OK) {
@@ -1280,23 +1170,19 @@ static void handle_boot_count(void)
         nvs_close(nvs_handle);
         return;
     }
-
     if (boot_count > BOOT_COUNT_THRESHOLD) {
-        ESP_LOGW(TAG, "Boot count %u exceeds threshold %d, resetting to factory defaults", 
+        ESP_LOGW(TAG, "Boot count %u exceeds threshold %d, resetting to factory defaults",
                  boot_count, BOOT_COUNT_THRESHOLD);
-
         // Preserve auth_code before erasing
         uint32_t auth_code = 0;
         esp_err_t auth_err = nvs_get_u32(nvs_handle, "auth_code", &auth_code);
         bool has_auth_code = (auth_err == ESP_OK);
-
         // Erase all except auth_code
         nvs_erase_all(nvs_handle);
         err = nvs_commit(nvs_handle);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to commit NVS erase: %s", esp_err_to_name(err));
         }
-
         // Restore auth_code if it existed
         if (has_auth_code) {
             err = nvs_set_u32(nvs_handle, "auth_code", auth_code);
@@ -1311,13 +1197,10 @@ static void handle_boot_count(void)
                 }
             }
         }
-
         nvs_close(nvs_handle);
         esp_restart();
     }
-
     nvs_close(nvs_handle);
-
     // Start one-shot timer for boot count reset
     esp_timer_handle_t boot_count_timer;
     const esp_timer_create_args_t timer_args = {
@@ -1335,10 +1218,7 @@ static void handle_boot_count(void)
         esp_timer_delete(boot_count_timer);
     }
 }
-
-
 static int s_retry_num = 0;
-
 static esp_err_t event_handler(void *ctx, system_event_t *event)
 {
     switch (event->event_id) {
@@ -1352,19 +1232,8 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
                 close(udp_sock);
                 udp_sock = -1;
             }
-            // 修复：使用 ip4addr_ntoa 格式化 IPv4 地址
-            char new_ip[16];
-            strcpy(new_ip, ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
-            if (debug_mode) ESP_LOGI(TAG, "Got my IP: %s (triggering discovery if needed)", new_ip);
-            
-            // Only rediscover if IP changed or first time
-            static char prev_ip[16] = {0};  // Persistent across calls
-            if (strcmp(new_ip, prev_ip) != 0 || needs_rediscovery) {
-                strcpy(prev_ip, new_ip);
-                strcpy(my_ip_addr, new_ip);
-                needs_rediscovery = true;
-            }
-            
+            if (debug_mode) ESP_LOGI(TAG, "Got IP, triggering discovery if needed");
+            needs_rediscovery = true;
             s_retry_num = 0;
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
@@ -1374,10 +1243,9 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
             gpio_set_level(LED_PIN, 1); // LED off (active-low)
-            // Clear IP on disconnect, force rediscovery
-            my_ip_addr[0] = '\0';
+            // Clear on disconnect, force rediscovery
             needs_rediscovery = true;
-            gateway_ip_discovered = false;  // Invalidate on WiFi loss
+            gateway_ip_discovered = false; // Invalidate on WiFi loss
             // Close sockets
             if (tcp_sock != -1) {
                 close(tcp_sock);
@@ -1399,7 +1267,6 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
     }
     return ESP_OK;
 }
-
 void wifi_init_sta(const char *ssid, const char *password)
 {
     s_wifi_event_group = xEventGroupCreate();
@@ -1416,7 +1283,6 @@ void wifi_init_sta(const char *ssid, const char *password)
         ESP_LOGE(TAG, "WiFi init failed: %s", esp_err_to_name(err));
         return;
     }
-
     wifi_config_t wifi_config = {
         .sta = {
             .channel = 0,
@@ -1425,7 +1291,6 @@ void wifi_init_sta(const char *ssid, const char *password)
     };
     strlcpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
     strlcpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
-
     err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Set WiFi mode failed: %s", esp_err_to_name(err));
@@ -1441,13 +1306,11 @@ void wifi_init_sta(const char *ssid, const char *password)
         ESP_LOGE(TAG, "WiFi start failed: %s", esp_err_to_name(err));
         return;
     }
-
     err = esp_wifi_set_max_tx_power(82);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Set WiFi TX power failed: %s", esp_err_to_name(err));
     }
 }
-
 void app_main(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -1459,10 +1322,13 @@ void app_main(void)
             return;
         }
     }
-
     // 初始化 TWDT：ESP8266 无参数版本
     esp_task_wdt_init();
-
+    out_seq = 0;
+    // Force debug_mode=1 for debugging (override NVS for now)
+    debug_mode = 1;
+    esp_log_level_set(TAG, ESP_LOG_INFO);  // Ensure logs are visible
+    ESP_LOGI(TAG, "Debug mode forced to 1 for troubleshooting");
     err = load_nvs_config(&current_baud_rate, &current_stop_bits, &current_parity, &current_data_bits, g_ssid, sizeof(g_ssid), g_password, sizeof(g_password), &debug_mode);
     if (err != ESP_OK) {
         strlcpy(g_ssid, DEFAULT_ESP_WIFI_SSID, sizeof(g_ssid));
@@ -1471,16 +1337,15 @@ void app_main(void)
         current_stop_bits = UART_STOP_BITS_1;
         current_parity = UART_PARITY_DISABLE;
         current_data_bits = UART_DATA_8_BITS;
-        debug_mode = 0;
-        esp_log_level_set(TAG, ESP_LOG_NONE);
+        debug_mode = 1;  // Force 1
+        esp_log_level_set(TAG, ESP_LOG_INFO);
     }
-
     handle_boot_count();
-    conn_state_init();  // Initialize connection state mutex
+    conn_state_init(); // Initialize connection state mutex
     led_init();
-    xTaskCreate(led_status_task, "led_status", 2048, NULL, 1, NULL);  // Low priority LED task
+    xTaskCreate(led_status_task, "led_status", 2048, NULL, 1, NULL); // Low priority LED task
     wifi_init_sta(g_ssid, g_password);
-    authorcodeverify();  // Now non-blocking on failure
+    authorcodeverify(); // Now non-blocking on failure
     uart_init(current_baud_rate, current_stop_bits, current_parity, current_data_bits);
     xTaskCreate(uart_tcp_bridge_task, "uart_tcp_bridge", 6144, NULL, 8, NULL);
     xTaskCreate(tcp_receive_task, "tcp_receive", 6144, NULL, 8, NULL);
