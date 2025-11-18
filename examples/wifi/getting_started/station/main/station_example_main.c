@@ -6,11 +6,11 @@
    software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
    CONDITIONS OF ANY KIND, either express or implied.
 */
-
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -29,16 +29,15 @@
 #include "driver/gpio.h"
 #include <regex.h>
 #include "esp_timer.h"
-#include "esp_task_wdt.h"  // TWDT ÷ß≥÷
-#include "lwip/ip4_addr.h"  // For ip4addr_ntoa if needed
+#include "esp_task_wdt.h" 
 
 #define DEFAULT_ESP_WIFI_SSID      "FUNLIGHT"
 #define DEFAULT_ESP_WIFI_PASS      "funlight"
 #define EXAMPLE_ESP_MAXIMUM_RETRY  10
 #define NVS_NAMESPACE              "config"
 #define BOOT_COUNT_KEY             "boot_count"
-#define BOOT_COUNT_THRESHOLD       6
-#define BOOT_COUNT_RESET_DELAY_MS  3000 // 3 seconds
+#define BOOT_COUNT_THRESHOLD       10
+#define BOOT_COUNT_RESET_DELAY_MS  2000 // 2 seconds
 
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
@@ -47,16 +46,13 @@ static EventGroupHandle_t s_wifi_event_group;
 static const char *TAG = "slave";
 
 #define PORT 12345
+#define UDP_PORT PORT
 #define CONFIG_EXAMPLE_IPV4 1
 #define UART_BUF_SIZE (512)
-#define TCP_RETRY_BASE_DELAY_MS 1000  // Start with 1s
-#define TCP_RETRY_MAX_DELAY_MS 32000  // Cap at 32s
+#define TCP_RETRY_DELAY_MS 2000
 #define TCP_CONNECT_TIMEOUT_MS 10000
-#define TCP_KEEPALIVE_IDLE_MS 5000    // 5s idle before probes
+#define TCP_KEEPALIVE_MS 10000
 #define RESPONSE_TIMEOUT_MS 5000
-#define UART_READ_TIMEOUT_MS 1        // 1ms for real-time ~50B reads
-#define FLUSH_BATCH_SIZE 100          // Flush if batch >=100B
-#define FLUSH_INTERVAL_MS 5           // Or every 5ms
 
 #define LED_PIN GPIO_NUM_2
 
@@ -66,11 +62,17 @@ static uint8_t current_parity = UART_PARITY_DISABLE;
 static uint8_t current_data_bits = UART_DATA_8_BITS;
 static bool is_tcp_connected = false;
 static int tcp_sock = -1;
+static int udp_sock = -1;
 static uint8_t debug_mode = 0;
+static struct sockaddr_in server_addr;
 
-// Reconnect backoff state
-static uint32_t tcp_reconnect_delay_ms = TCP_RETRY_BASE_DELAY_MS;
-static uint32_t last_reconnect_time = 0;
+typedef enum {
+    LED_SLOW_BLINK,
+    LED_FAST_BLINK,
+    LED_SOLID_ON
+} led_state_t;
+
+static volatile led_state_t current_led_state = LED_SLOW_BLINK;  // FIX: Added volatile for multi-task safety
 
 /* CRC32 computation for ESP8266 */
 static uint32_t compute_crc32(const uint8_t *data, size_t len)
@@ -98,10 +100,10 @@ static void authorcodeverify(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open NVS for auth: %s", esp_err_to_name(err));
         while (1) {
-            gpio_set_level(LED_PIN, 0); // on
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            gpio_set_level(LED_PIN, 0); // on (active-low)
+            vTaskDelay(pdMS_TO_TICKS(1000));
             gpio_set_level(LED_PIN, 1); // off
-            vTaskDelay(3000 / portTICK_PERIOD_MS);
+            vTaskDelay(pdMS_TO_TICKS(3000));
         }
     }
 
@@ -112,9 +114,9 @@ static void authorcodeverify(void)
         nvs_close(nvs_handle);
         while (1) {
             gpio_set_level(LED_PIN, 0); // on
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            vTaskDelay(pdMS_TO_TICKS(1000));
             gpio_set_level(LED_PIN, 1); // off
-            vTaskDelay(3000 / portTICK_PERIOD_MS);
+            vTaskDelay(pdMS_TO_TICKS(3000));
         }
     }
 
@@ -130,9 +132,9 @@ static void authorcodeverify(void)
             nvs_close(nvs_handle);
             while (1) {
                 gpio_set_level(LED_PIN, 0); // on
-                vTaskDelay(1000 / portTICK_PERIOD_MS);
+                vTaskDelay(pdMS_TO_TICKS(1000));
                 gpio_set_level(LED_PIN, 1); // off
-                vTaskDelay(3000 / portTICK_PERIOD_MS);
+                vTaskDelay(pdMS_TO_TICKS(3000));
             }
         }
         err = nvs_commit(nvs_handle);
@@ -147,9 +149,9 @@ static void authorcodeverify(void)
         nvs_close(nvs_handle);
         while (1) {
             gpio_set_level(LED_PIN, 0); // on
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            vTaskDelay(pdMS_TO_TICKS(1000));
             gpio_set_level(LED_PIN, 1); // off
-            vTaskDelay(3000 / portTICK_PERIOD_MS);
+            vTaskDelay(pdMS_TO_TICKS(3000));
         }
     }
 
@@ -159,14 +161,41 @@ static void authorcodeverify(void)
         nvs_close(nvs_handle);
         while (1) {
             gpio_set_level(LED_PIN, 0); // on
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            vTaskDelay(pdMS_TO_TICKS(1000));
             gpio_set_level(LED_PIN, 1); // off
-            vTaskDelay(3000 / portTICK_PERIOD_MS);
+            vTaskDelay(pdMS_TO_TICKS(3000));
         }
     }
 
     ESP_LOGI(TAG, "Auth verification passed");
     nvs_close(nvs_handle);
+}
+
+/* Custom putchar for UART1 */
+// static int uart1_putchar(char c)
+// {
+//     uart_write_bytes(UART_NUM_1, (const char *)&c, 1);
+//     return 1;
+// }
+
+/* Initialize UART1 for logging */
+static void uart1_init(void)
+{
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    esp_err_t err = uart_param_config(UART_NUM_1, &uart_config);
+    if (err != ESP_OK) {
+        // Fallback, but continue
+    }
+    err = uart_driver_install(UART_NUM_1, 256, 0, 0, NULL, 0);
+    if (err != ESP_OK) {
+        // Fallback, but continue
+    }
 }
 
 /* Initialize UART0 */
@@ -183,7 +212,7 @@ static void uart_init(uint32_t baud_rate, uint8_t stop_bits, uint8_t parity, uin
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "UART param config failed: %s", esp_err_to_name(err));
     }
-    // ‘ˆ¥Û TX buffer µΩ 2048£¨±‹√‚ queue ¬˙◊Ë»˚
+    // Â¢ûÂ§ß TX buffer Âà∞ 2048ÔºåÈÅøÂÖç queue Êª°ÈòªÂ°û
     err = uart_driver_install(UART_NUM_0, UART_BUF_SIZE * 2, UART_BUF_SIZE * 4, 0, NULL, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(err));
@@ -193,7 +222,8 @@ static void uart_init(uint32_t baud_rate, uint8_t stop_bits, uint8_t parity, uin
 /* Check WiFi connection status */
 static bool is_wifi_connected(void)
 {
-    return (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, 100 / portTICK_PERIOD_MS);
+    return (bits & WIFI_CONNECTED_BIT) != 0;
 }
 
 /* Initialize LED on GPIO2 */
@@ -217,30 +247,26 @@ static void led_init(void)
 static void led_task(void *pvParameters)
 {
     while (1) {
-        bool wifi_ok = is_wifi_connected();
-        bool tcp_ok = is_tcp_connected;
-
-        if (!wifi_ok) {
-            // ¬˝…¡: ¡¡500ms, √500ms
-            gpio_set_level(LED_PIN, 0); // on
-            vTaskDelay(500 / portTICK_PERIOD_MS);
-            gpio_set_level(LED_PIN, 1); // off
-            vTaskDelay(500 / portTICK_PERIOD_MS);
-        } else if (!tcp_ok) {
-            // øÏ…¡: ¡¡200ms, √200ms
-            gpio_set_level(LED_PIN, 0); // on
-            vTaskDelay(200 / portTICK_PERIOD_MS);
-            gpio_set_level(LED_PIN, 1); // off
-            vTaskDelay(200 / portTICK_PERIOD_MS);
-        } else {
-            // ≥£¡¡: on, ºÏ≤È◊¥Ã¨√ø1000ms
-            gpio_set_level(LED_PIN, 0); // on
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
+        switch (current_led_state) {
+            case LED_SLOW_BLINK:
+                gpio_set_level(LED_PIN, 0); // on
+                vTaskDelay(500 / portTICK_PERIOD_MS);
+                gpio_set_level(LED_PIN, 1); // off
+                vTaskDelay(1500 / portTICK_PERIOD_MS);
+                break;
+            case LED_FAST_BLINK:
+                gpio_set_level(LED_PIN, 0); // on
+                vTaskDelay(200 / portTICK_PERIOD_MS);
+                gpio_set_level(LED_PIN, 1); // off
+                vTaskDelay(300 / portTICK_PERIOD_MS);
+                break;
+            case LED_SOLID_ON:
+                gpio_set_level(LED_PIN, 0); // on
+                vTaskDelay(100 / portTICK_PERIOD_MS); // FIX: Reduced to 100ms for faster state checks without high CPU
+                break;
         }
-
         esp_task_wdt_reset();
     }
-
     vTaskDelete(NULL);
 }
 
@@ -348,7 +374,7 @@ static void print_raw_data(const uint8_t *data, size_t len)
 {
     if (!data || len == 0) return;
 
-    // Œπ TWDT «∞
+    // ÂñÇ TWDT Ââç
     esp_task_wdt_reset();
 
     static bool initialized = false;
@@ -362,54 +388,23 @@ static void print_raw_data(const uint8_t *data, size_t len)
         if (written != len) {
             ESP_LOGW(TAG, "UART write incomplete: %d/%zu bytes", written, len);
         }
-        // “∆≥˝ uart_wait_tx_done()£∫±‹√‚◊Ë»˚£¨‘ –Ì“Ï≤Ω TX
+        // ÁßªÈô§ uart_wait_tx_done()ÔºöÈÅøÂÖçÈòªÂ°ûÔºåÂÖÅËÆ∏ÂºÇÊ≠• TX
         xSemaphoreGive(raw_log_mutex);
     } else {
         uart_write_bytes(UART_NUM_0, (const char *)data, len);
-        // “∆≥˝ uart_wait_tx_done()
+        // ÁßªÈô§ uart_wait_tx_done()
     }
 
-    // Œπ TWDT ∫Û
+    // ÂñÇ TWDT Âêé
     esp_task_wdt_reset();
-}
-
-/* Non-blocking send with retry */
-static esp_err_t nonblocking_send(int sock, const char *payload, size_t payload_len, int max_retries) {
-    size_t sent = 0;
-    while (sent < payload_len) {
-        int bytes = send(sock, payload + sent, payload_len - sent, 0);
-        if (bytes > 0) {
-            sent += bytes;
-            esp_task_wdt_reset();  // Feed during retries
-            continue;
-        }
-        if (bytes < 0) {
-            int lwip_errno = errno;
-            if (lwip_errno == EAGAIN || lwip_errno == EWOULDBLOCK) {
-                if (--max_retries <= 0) {
-                    ESP_LOGW(TAG, "Send EAGAIN timeout after %d retries (buffer full?)", max_retries + 1);
-                    return ESP_ERR_TIMEOUT;  // Transient
-                }
-                vTaskDelay(1 / portTICK_PERIOD_MS);
-                continue;
-            } else {
-                ESP_LOGE(TAG, "Send real error: errno %d", lwip_errno);
-                return ESP_FAIL;  // Fatal
-            }
-        }
-    }
-    return ESP_OK;
 }
 
 /* TCP send data with optional response expectation */
 static esp_err_t tcp_send_data(int sock, const char *payload, size_t payload_len, char *rx_buffer, size_t rx_buffer_size, bool expect_response)
 {
-    esp_err_t send_err = nonblocking_send(sock, payload, payload_len, 50);  // ~20ms retries
-    if (send_err == ESP_ERR_TIMEOUT) {
-        ESP_LOGW(TAG, "Transient send timeout, returning non-fatal");
-        return ESP_ERR_TIMEOUT;
-    } else if (send_err != ESP_OK) {
-        ESP_LOGE(TAG, "Fatal error during sending: %s", esp_err_to_name(send_err));
+    int err = send(sock, payload, payload_len, 0);
+    if (err < 0) {
+        ESP_LOGE(TAG, "Error during sending: errno %d", errno);
         return ESP_FAIL;
     }
 
@@ -436,13 +431,13 @@ static esp_err_t tcp_send_data(int sock, const char *payload, size_t payload_len
     return ESP_OK;
 }
 
-static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t len)
+static esp_err_t parse_command(int sock, const uint8_t *rx_buffer, size_t len, bool is_tcp)
 {
     if (!rx_buffer || len == 0) {
         return ESP_FAIL;
     }
 
-    // øÏÀŸ¬∑æ∂£∫»Áπ˚∫¨ \r\n£¨ºŸ…Ë√¸¡Ó£ª∑Ò‘Ú passthrough
+    // Âø´ÈÄüË∑ØÂæÑÔºöÂ¶ÇÊûúÂê´ \r\nÔºåÂÅáËÆæÂëΩ‰ª§ÔºõÂê¶Âàô passthrough
     bool is_likely_command = (memchr(rx_buffer, '\r', len) != NULL || memchr(rx_buffer, '\n', len) != NULL);
     if (!is_likely_command) {
         print_raw_data(rx_buffer, len);
@@ -480,7 +475,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (ret != 0) {
             ESP_LOGE(TAG, "Failed to compile regex: %d", ret);
             const char *response = "Internal error: regex compilation failed\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -490,7 +489,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (ret != 0) {
             ESP_LOGE(TAG, "Invalid BAUD command format: no match for '%s'", buf);
             const char *response = "Invalid BAUD command format\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -503,7 +506,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (baud_len >= sizeof(baud_str)) {
             ESP_LOGE(TAG, "BAUD value too long");
             const char *response = "Invalid baud rate\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -513,7 +520,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (*endptr != 0) {
             ESP_LOGE(TAG, "Invalid BAUD value: non-numeric '%s'", baud_str);
             const char *response = "Invalid baud rate\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -525,7 +536,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (stopbit_len >= sizeof(stopbit_str)) {
             ESP_LOGE(TAG, "STOPBIT value too long");
             const char *response = "Invalid stop bits\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -535,7 +550,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (*endptr != 0) {
             ESP_LOGE(TAG, "Invalid STOPBIT value: non-numeric '%s'", stopbit_str);
             const char *response = "Invalid stop bits\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -548,7 +567,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (parity_len >= sizeof(parity_str)) {
             ESP_LOGE(TAG, "PARITY value too long");
             const char *response = "Invalid parity\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -558,7 +581,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (*endptr != 0) {
             ESP_LOGE(TAG, "Invalid PARITY value: non-numeric '%s'", parity_str);
             const char *response = "Invalid parity\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -571,7 +598,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (databit_len >= sizeof(databit_str)) {
             ESP_LOGE(TAG, "DATABIT value too long");
             const char *response = "Invalid data bits\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -581,7 +612,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (*endptr != 0) {
             ESP_LOGE(TAG, "Invalid DATABIT value: non-numeric '%s'", databit_str);
             const char *response = "Invalid data bits\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             regfree(&regex);
             return ESP_FAIL;
@@ -594,21 +629,33 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (new_baud < 110 || new_baud > 2000000) {
             ESP_LOGE(TAG, "Invalid baud rate: %u", new_baud);
             const char *response = "Invalid baud rate\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             return ESP_FAIL;
         }
 
         if (new_stop_bits != UART_STOP_BITS_1 && new_stop_bits != UART_STOP_BITS_2) {
             ESP_LOGE(TAG, "Invalid stop bits: %u (raw value: %u)", new_stop_bits, raw_stop_bits);
             const char *response = "Invalid stop bits\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             return ESP_FAIL;
         }
 
         if (new_parity != UART_PARITY_DISABLE && new_parity != UART_PARITY_ODD && new_parity != UART_PARITY_EVEN) {
             ESP_LOGE(TAG, "Invalid parity: %u", new_parity);
             const char *response = "Invalid parity\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             return ESP_FAIL;
         }
 
@@ -616,7 +663,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         if (raw_data_bits < 5 || raw_data_bits > 8) {
             ESP_LOGE(TAG, "Invalid data bits: %u", raw_data_bits);
             const char *response = "Invalid data bits\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             return ESP_FAIL;
         }
         uint8_t new_data_bits = raw_data_bits - 5;
@@ -661,13 +712,21 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
             if (strlen(ssid) == 0 || strlen(ssid) > 32 || !isprint((unsigned char)ssid[0])) {
                 ESP_LOGE(TAG, "Invalid SSID from server: %s", ssid);
                 const char *response = "Invalid SSID\r\n";
-                nonblocking_send(sock, response, strlen(response), 3);
+                if (is_tcp) {
+                    send(sock, response, strlen(response), 0);
+                } else {
+                    sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+                }
                 free(buf);
                 return ESP_FAIL;
             } else if (strlen(password) > 0 && (strlen(password) < 8 || strlen(password) > 64 || !isprint((unsigned char)password[0]))) {
                 ESP_LOGE(TAG, "Invalid password from server");
                 const char *response = "Invalid password\r\n";
-                nonblocking_send(sock, response, strlen(response), 3);
+                if (is_tcp) {
+                    send(sock, response, strlen(response), 0);
+                } else {
+                    sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+                }
                 free(buf);
                 return ESP_FAIL;
             } else {
@@ -680,7 +739,11 @@ static esp_err_t parse_tcp_command(int sock, const uint8_t *rx_buffer, size_t le
         } else {
             ESP_LOGE(TAG, "Invalid WIFI command format from server");
             const char *response = "Invalid WIFI command format\r\n";
-            nonblocking_send(sock, response, strlen(response), 3);
+            if (is_tcp) {
+                send(sock, response, strlen(response), 0);
+            } else {
+                sendto(sock, response, strlen(response), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
             free(buf);
             return ESP_FAIL;
         }
@@ -701,55 +764,152 @@ static void tcp_receive_task(void *pvParameters)
 
     while (1) {
         if (!is_tcp_connected || tcp_sock == -1) {
-            vTaskDelay(100 / portTICK_PERIOD_MS);  // Reduced from 500ms, but not too aggressive
-            esp_task_wdt_reset();  // Œππ∑
+            vTaskDelay(500 / portTICK_PERIOD_MS); 
+            esp_task_wdt_reset();  
             continue;
         }
 
         int len = recv(tcp_sock, rx_buffer, UART_BUF_SIZE - 1, 0);
         if (len < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                vTaskDelay(1 / portTICK_PERIOD_MS);  // 1ms yield for non-blocking
+                vTaskDelay(20 / portTICK_PERIOD_MS);  // FIX: Increased from 5ms to 20ms to reduce polling aggressiveness and allow lower-pri tasks (e.g., LED) to run
                 esp_task_wdt_reset();
                 continue;
             }
-            // Real disconnect: ECONNRESET, ETIMEDOUT, etc.
-            ESP_LOGW(TAG, "TCP disconnect detected: errno %d, marking for reconnect...", errno);
+            ESP_LOGW(TAG, "Receive failed: errno %d, reconnecting...", errno);  // ÔøΩÔøΩÔøΩ√æÔøΩÔøΩÔøΩÔøΩÔøΩ÷æ
             is_tcp_connected = false;
             close(tcp_sock);
             tcp_sock = -1;
+            if (is_wifi_connected()) {
+                current_led_state = LED_FAST_BLINK;
+            } else {
+                current_led_state = LED_SLOW_BLINK;
+            }
+            vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
             esp_task_wdt_reset();
             continue;
         } else if (len == 0) {
-            ESP_LOGI(TAG, "TCP connection closed by peer, marking for reconnect...");
+            ESP_LOGI(TAG, "Connection closed by server, reconnecting...");
             is_tcp_connected = false;
             close(tcp_sock);
             tcp_sock = -1;
+            if (is_wifi_connected()) {
+                current_led_state = LED_FAST_BLINK;
+            } else {
+                current_led_state = LED_SLOW_BLINK;
+            }
+            vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
             esp_task_wdt_reset();
             continue;
         }
 
-        // ”≈ªØ debug hex log£∫len > 128  ±Ωˆ’™“™£¨±‹√‚¬˝—≠ª∑
-        if (debug_mode && len <= 128) {
-            char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};  // +1 for null
-            char *ptr = hex_buf;
-            for (int i = 0; i < len; i++) {
-                ptr += sprintf(ptr, "%02X ", rx_buffer[i]);  // sprintf ÷±Ω”◊∑º”£¨Œﬁ strlen
+     
+        if (debug_mode) {
+            if (len <= 200) {
+                char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};  // +1 for null
+                char *ptr = hex_buf;
+                for (int i = 0; i < len; i++) {
+                    ptr += sprintf(ptr, "%02X ", rx_buffer[i]); 
+                }
+                ESP_LOGI(TAG, "Raw TCP receive buffer (hex): %s (length: %d)", hex_buf, len);
+            } else {
+                ESP_LOGI(TAG, "Large TCP packet received: %d bytes (hex log skipped)", len);
             }
-            ESP_LOGI(TAG, "Raw TCP receive buffer (hex): %s (length: %d)", hex_buf, len);
-        } else if (debug_mode) {
-            ESP_LOGI(TAG, "TCP packet received: %d bytes (hex log skipped)", len);
         }
 
         // Parse and process the received data
-        esp_err_t result = parse_tcp_command(tcp_sock, rx_buffer, len);
+        esp_err_t result = parse_command(tcp_sock, rx_buffer, len, true);
         if (result != ESP_OK) {
             ESP_LOGW(TAG, "Failed to parse TCP command (len=%d)", len);
         }
 
-        esp_task_wdt_reset();  // √ø—≠ª∑Œππ∑
+        vTaskDelay(10 / portTICK_PERIOD_MS);  // FIX: Increased from 1ms to 10ms to yield more time to lower-priority tasks like LED
+        esp_task_wdt_reset();  
     }
 
+    free(rx_buffer);
+    vTaskDelete(NULL);
+}
+
+static void udp_receive_task(void *pvParameters)
+{
+    uint8_t *rx_buffer = (uint8_t *) malloc(UART_BUF_SIZE);  // FIX: Changed to uint8_t* for binary
+    if (!rx_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate memory for UDP receive buffer");
+        vTaskDelete(NULL);
+    }
+
+    udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (udp_sock < 0) {
+        ESP_LOGE(TAG, "Unable to create UDP socket: errno %d", errno);
+        free(rx_buffer);
+        vTaskDelete(NULL);
+    }
+
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(UDP_PORT);
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(udp_sock, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+        ESP_LOGE(TAG, "UDP bind failed: errno %d", errno);
+        close(udp_sock);
+        free(rx_buffer);
+        vTaskDelete(NULL);
+    }
+
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 100000;  // 100 ms
+    setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    ESP_LOGI(TAG, "UDP receive task started on port %d", UDP_PORT);
+
+    while (1) {
+        int len = recv(udp_sock, rx_buffer, UART_BUF_SIZE - 1, 0);
+        if (len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+                esp_task_wdt_reset();
+                continue;
+            }
+            ESP_LOGW(TAG, "UDP receive failed: errno %d", errno);
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            esp_task_wdt_reset();
+            continue;
+        } else if (len == 0) {
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+            esp_task_wdt_reset();
+            continue;
+        }
+
+        // ÔøΩ≈ªÔøΩ debug hex logÔøΩÔøΩlen > 200  ±ÔøΩÔøΩ’™“™ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ—≠ÔøΩÔøΩ
+        if (debug_mode) {
+            if (len <= 200) {
+                char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};  // +1 for null
+                char *ptr = hex_buf;
+                for (int i = 0; i < len; i++) {
+                    ptr += sprintf(ptr, "%02X ", rx_buffer[i]);  // sprintf ÷±ÔøΩÔøΩ◊∑ÔøΩ”£ÔøΩÔøΩÔøΩ strlen
+                }
+                ESP_LOGI(TAG, "Raw UDP receive buffer (hex): %s (length: %d)", hex_buf, len);
+            } else {
+                ESP_LOGI(TAG, "Large UDP packet received: %d bytes (hex log skipped)", len);
+            }
+        }
+
+        // Parse and process the received data
+        esp_err_t result = parse_command(udp_sock, rx_buffer, len, false);
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to parse UDP command (len=%d)", len);
+        }
+
+        vTaskDelay(1 / portTICK_PERIOD_MS);  // ÔøΩÔøΩÔøΩÃµÔøΩ 1msÔøΩÔøΩÔøΩÔøΩÔøΩ yield ∆µÔøΩÔøΩ
+        esp_task_wdt_reset();  // √ø—≠ÔøΩÔøΩŒπÔøΩÔøΩ
+    }
+
+    if (udp_sock >= 0) {
+        close(udp_sock);
+    }
     free(rx_buffer);
     vTaskDelete(NULL);
 }
@@ -757,48 +917,39 @@ static void tcp_receive_task(void *pvParameters)
 /* UART command and TCP bridge task */
 static void uart_tcp_bridge_task(void *pvParameters)
 {
-    char *rx_buffer = malloc(UART_BUF_SIZE);
+    uint8_t *uart_data = (uint8_t *) malloc(UART_BUF_SIZE);
+    char *rx_buffer = (char *) malloc(UART_BUF_SIZE);
 
-    if (!rx_buffer) {
+    if (!uart_data || !rx_buffer) {
         ESP_LOGE(TAG, "Failed to allocate memory for buffers");
         vTaskDelete(NULL);
     }
 
-    uint8_t uart_batch[UART_BUF_SIZE];  // Small batch buffer for real-time
-    size_t batch_len = 0;
-    uint32_t last_flush = 0;  // For periodic flush
-
     while (1) {
-        // Real-time read: Short 1ms timeout for ~50B chunks
-        int len = uart_read_bytes(UART_NUM_0, uart_batch + batch_len, sizeof(uart_batch) - batch_len - 1, UART_READ_TIMEOUT_MS / portTICK_PERIOD_MS);
+        int len = uart_read_bytes(UART_NUM_0, uart_data, UART_BUF_SIZE - 1, 20 / portTICK_PERIOD_MS);
         if (len > 0) {
-            batch_len += len;
+            uart_data[len] = 0;
+            char *cmd = (char *)uart_data;
+            if (debug_mode) ESP_LOGI(TAG, "Raw UART input: %s", cmd);
 
-            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            // Flush if batch >=100B or 5ms elapsed
-            if (batch_len >= FLUSH_BATCH_SIZE || (now - last_flush >= FLUSH_INTERVAL_MS)) {
-                if (tcp_sock != -1 && is_tcp_connected) {
-                    esp_err_t send_result = tcp_send_data(tcp_sock, (char*)uart_batch, batch_len, rx_buffer, UART_BUF_SIZE, false);
-                    if (send_result == ESP_ERR_TIMEOUT) {
-                        ESP_LOGW(TAG, "Send timeout, skipping this batch but continuing (no drop, len=%u; will retry next)", (unsigned)batch_len);
-                        // ≤ªdrop£°÷ÿ÷√batch£¨±‹√‚backlog£ªœ¬—≠ª∑÷ÿ–¬¿€ª˝
-                    } else if (send_result != ESP_OK) {
-                        ESP_LOGW(TAG, "Fatal send error, closing socket and marking for reconnect (len=%u, err=%s)", 
-                                (unsigned)batch_len, esp_err_to_name(send_result));
-                        is_tcp_connected = false;
-                        if (tcp_sock != -1) {
-                            close(tcp_sock);
-                            tcp_sock = -1;
-                        }
-                    } else if (debug_mode) {
-                        ESP_LOGI(TAG, "Flushed %zu bytes to TCP (real-time)", batch_len);
+            if (tcp_sock != -1) {
+                esp_err_t send_result = tcp_send_data(tcp_sock, cmd, len, rx_buffer, UART_BUF_SIZE, false);
+                if (send_result != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to send UART data over TCP, reconnecting...");
+                    close(tcp_sock);
+                    tcp_sock = -1;
+                    is_tcp_connected = false;
+                    if (is_wifi_connected()) {
+                        current_led_state = LED_FAST_BLINK;
+                    } else {
+                        current_led_state = LED_SLOW_BLINK;
                     }
-                    batch_len = 0;  //  º÷’÷ÿ÷√batch£®≥…π¶ªÚtimeout£©
-                    last_flush = now;
-                } else {
-                    ESP_LOGE(TAG, "TCP not connected, dropping batched data (len=%u)", (unsigned)batch_len);
-                    batch_len = 0;  // «Âø’£¨±‹√‚¿€ª˝
+                } else if (debug_mode) {
+                    ESP_LOGI(TAG, "Transparent message sent: %s", cmd);
                 }
+            } else {
+                ESP_LOGE(TAG, "TCP not connected, cannot send data");
+                // print_raw_log("TCP not connected\r\n");
             }
         }
 
@@ -808,25 +959,14 @@ static void uart_tcp_bridge_task(void *pvParameters)
                 close(tcp_sock);
                 tcp_sock = -1;
                 is_tcp_connected = false;
+                current_led_state = LED_SLOW_BLINK;
             }
-            batch_len = 0;  // Clear batch on disconnect
             vTaskDelay(1000 / portTICK_PERIOD_MS);
             esp_task_wdt_reset();
             continue;
         }
 
-        // Attempt TCP connect only if needed
-        if (is_tcp_connected && tcp_sock != -1) {
-            // Connection healthy, quick check
-            vTaskDelay(1 / portTICK_PERIOD_MS);  // Minimal yield
-        } else if (tcp_sock == -1 && is_wifi_connected()) {
-            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (now - last_reconnect_time < tcp_reconnect_delay_ms) {
-                vTaskDelay(1 / portTICK_PERIOD_MS);  // Short yield if backoff active
-                esp_task_wdt_reset();
-                continue;
-            }
-
+        if (tcp_sock == -1 && is_wifi_connected()) {
             struct sockaddr_in dest_addr;
             dest_addr.sin_addr.s_addr = inet_addr(HOST_IP_ADDR);
             dest_addr.sin_family = AF_INET;
@@ -834,10 +974,8 @@ static void uart_tcp_bridge_task(void *pvParameters)
 
             tcp_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
             if (tcp_sock < 0) {
-                ESP_LOGE(TAG, "Unable to create TCP socket: errno %d", errno);
-                last_reconnect_time = now;
-                tcp_reconnect_delay_ms = (tcp_reconnect_delay_ms * 2 > TCP_RETRY_MAX_DELAY_MS) ? TCP_RETRY_MAX_DELAY_MS : tcp_reconnect_delay_ms * 2;
-                vTaskDelay(tcp_reconnect_delay_ms / portTICK_PERIOD_MS);
+                ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+                vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
                 esp_task_wdt_reset();
                 continue;
             }
@@ -848,50 +986,34 @@ static void uart_tcp_bridge_task(void *pvParameters)
             setsockopt(tcp_sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
             setsockopt(tcp_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-            // Enhanced keepalive: Shorter idle (5s) with fewer probes (3) for ~8s detection
             int keepalive = 1;
-            int keepidle = 5;      // 5s idle before probes
-            int keepintvl = 1;     // 1s between probes
-            int keepcnt = 3;       // 3 probes
+            int keepidle = TCP_KEEPALIVE_MS / 1000;
+            int keepintvl = 2;
+            int keepcnt = 3;
             setsockopt(tcp_sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
             setsockopt(tcp_sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
             setsockopt(tcp_sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
             setsockopt(tcp_sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
-            ESP_LOGI(TAG, "TCP Keepalive optimized: idle=5s, probes=3x1s (total ~8s detection)");
-
-            // Disable Nagle's algorithm for real-time small-packet sending
-            int nodelay = 1;
-            setsockopt(tcp_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-            ESP_LOGI(TAG, "TCP_NODELAY enabled for real-time sending");
-
-            // Set larger TCP send buffer (64kB)
-            int send_buf_size = 65536;  // 64kB
-            setsockopt(tcp_sock, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size));
-            if (debug_mode) ESP_LOGI(TAG, "Set TCP SO_SNDBUF to 64kB");
 
             int err = connect(tcp_sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
             if (err != 0) {
-                ESP_LOGW(TAG, "TCP unable to connect to %s:%d: errno %d", HOST_IP_ADDR, PORT, errno);
+                ESP_LOGW(TAG, "Socket unable to connect to %s:%d: errno %d", HOST_IP_ADDR, PORT, errno);
                 close(tcp_sock);
                 tcp_sock = -1;
                 is_tcp_connected = false;
-                last_reconnect_time = now;
-                tcp_reconnect_delay_ms = (tcp_reconnect_delay_ms * 2 > TCP_RETRY_MAX_DELAY_MS) ? TCP_RETRY_MAX_DELAY_MS : tcp_reconnect_delay_ms * 2;
-                vTaskDelay(tcp_reconnect_delay_ms / portTICK_PERIOD_MS);
+                vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
                 esp_task_wdt_reset();
                 continue;
             }
 
-            // Set non-blocking after connect
+       
             int flags = fcntl(tcp_sock, F_GETFL, 0);
             if (flags < 0) {
                 ESP_LOGE(TAG, "fcntl F_GETFL failed: errno %d", errno);
                 close(tcp_sock);
                 tcp_sock = -1;
                 is_tcp_connected = false;
-                last_reconnect_time = now;
-                tcp_reconnect_delay_ms = (tcp_reconnect_delay_ms * 2 > TCP_RETRY_MAX_DELAY_MS) ? TCP_RETRY_MAX_DELAY_MS : tcp_reconnect_delay_ms * 2;
-                vTaskDelay(tcp_reconnect_delay_ms / portTICK_PERIOD_MS);
+                vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
                 esp_task_wdt_reset();
                 continue;
             }
@@ -900,29 +1022,32 @@ static void uart_tcp_bridge_task(void *pvParameters)
                 close(tcp_sock);
                 tcp_sock = -1;
                 is_tcp_connected = false;
-                last_reconnect_time = now;
-                tcp_reconnect_delay_ms = (tcp_reconnect_delay_ms * 2 > TCP_RETRY_MAX_DELAY_MS) ? TCP_RETRY_MAX_DELAY_MS : tcp_reconnect_delay_ms * 2;
-                vTaskDelay(tcp_reconnect_delay_ms / portTICK_PERIOD_MS);
+                vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
                 esp_task_wdt_reset();
                 continue;
             }
 
-            ESP_LOGI(TAG, "Successfully connected to %s:%d (backoff reset)", HOST_IP_ADDR, PORT);
+            // ESP_LOGI(TAG, "Successfully connected to %s:%d", HOST_IP_ADDR, PORT);
             is_tcp_connected = true;
-            tcp_reconnect_delay_ms = TCP_RETRY_BASE_DELAY_MS;  // Reset backoff on success
-            gpio_set_level(LED_PIN, 0); // Ensure LED on upon TCP connect
-        } else {
-            vTaskDelay(500 / portTICK_PERIOD_MS);  // Wait if no WiFi
+            current_led_state = LED_SOLID_ON;
+            vTaskDelay(10 / portTICK_PERIOD_MS);  // FIX: Added short yield after state change to allow low-pri LED task to execute promptly
         }
 
-        esp_task_wdt_reset();  // √ø—≠ª∑Œππ∑
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+        esp_task_wdt_reset();  
     }
 
     if (tcp_sock != -1) {
         close(tcp_sock);
         tcp_sock = -1;
         is_tcp_connected = false;
+        if (is_wifi_connected()) {
+            current_led_state = LED_FAST_BLINK;
+        } else {
+            current_led_state = LED_SLOW_BLINK;
+        }
     }
+    free(uart_data);
     free(rx_buffer);
     vTaskDelete(NULL);
 }
@@ -991,10 +1116,17 @@ static void handle_boot_count(void)
         bool has_auth_code = (auth_err == ESP_OK);
 
         // Erase all except auth_code
-        nvs_erase_all(nvs_handle);
+        err = nvs_erase_all(nvs_handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to erase NVS: %s", esp_err_to_name(err));
+            nvs_close(nvs_handle);
+            return;
+        }
         err = nvs_commit(nvs_handle);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to commit NVS erase: %s", esp_err_to_name(err));
+            nvs_close(nvs_handle);
+            return;
         }
 
         // Restore auth_code if it existed
@@ -1013,6 +1145,8 @@ static void handle_boot_count(void)
         }
 
         nvs_close(nvs_handle);
+        ESP_LOGI(TAG, "Factory reset completed, restarting...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
         esp_restart();
     }
 
@@ -1045,20 +1179,16 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
             esp_wifi_connect();
             break;
         case SYSTEM_EVENT_STA_GOT_IP:
+            // ESP_LOGI(TAG, "got ip:%s", ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
             s_retry_num = 0;
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            // LED managed by LED task, not here
+            current_led_state = is_tcp_connected ? LED_SOLID_ON : LED_FAST_BLINK;
             break;
         case SYSTEM_EVENT_STA_DISCONNECTED:
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            // Close sockets
-            if (tcp_sock != -1) {
-                close(tcp_sock);
-                tcp_sock = -1;
-                is_tcp_connected = false;
-            }
+            current_led_state = LED_SLOW_BLINK;
             esp_wifi_connect();
             s_retry_num++;
             if (s_retry_num >= EXAMPLE_ESP_MAXIMUM_RETRY) {
@@ -1121,6 +1251,10 @@ void wifi_init_sta(const char *ssid, const char *password)
 
 void app_main(void)
 {
+    esp_log_level_set("wifi", ESP_LOG_NONE);
+    esp_log_level_set("tcpip_adapter", ESP_LOG_NONE);
+    esp_log_level_set("*", ESP_LOG_NONE);  // ÂÖúÂ∫ïÁ¶ÅÁî®ÊâÄÊúâ
+
     esp_err_t err = nvs_flash_init();
     if (err != ESP_OK) {
         nvs_flash_erase();
@@ -1131,8 +1265,11 @@ void app_main(void)
         }
     }
 
-    // ≥ı ºªØ TWDT£∫ESP8266 Œﬁ≤Œ ˝∞Ê±æ
+
     esp_task_wdt_init();
+
+    // uart1_init();
+    // esp_log_set_putchar(uart1_putchar);
 
     char ssid[32] = {0};
     char password[64] = {0};
@@ -1145,15 +1282,22 @@ void app_main(void)
         current_parity = UART_PARITY_DISABLE;
         current_data_bits = UART_DATA_8_BITS;
         debug_mode = 0;
-        esp_log_level_set(TAG, ESP_LOG_NONE);
+        // esp_log_level_set(TAG, ESP_LOG_NONE);
     }
+
+    // Initialize server address for UDP responses
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    server_addr.sin_addr.s_addr = inet_addr(HOST_IP_ADDR);
 
     handle_boot_count();
     led_init();
-    authorcodeverify();
+    xTaskCreate(led_task, "led_task", 2048, NULL, 5, NULL);  // Kept low priority as requested
     wifi_init_sta(ssid, password);
+    authorcodeverify();
     uart_init(current_baud_rate, current_stop_bits, current_parity, current_data_bits);
-    xTaskCreate(led_task, "led_task", 2048, NULL, 5, NULL);
     xTaskCreate(uart_tcp_bridge_task, "uart_tcp_bridge", 6144, NULL, 8, NULL);
     xTaskCreate(tcp_receive_task, "tcp_receive", 6144, NULL, 8, NULL);
+    xTaskCreate(udp_receive_task, "udp_receive", 6144, NULL, 8, NULL);
 }
