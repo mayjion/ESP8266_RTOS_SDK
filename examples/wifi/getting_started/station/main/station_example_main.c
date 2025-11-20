@@ -783,79 +783,78 @@ static esp_err_t parse_command(int sock, const uint8_t *rx_buffer, size_t len, b
     }
 }
 
+/* TCP receive task - Optimized for high-frequency small packets */
 static void tcp_receive_task(void *pvParameters)
 {
-    uint8_t *rx_buffer = (uint8_t *) malloc(UART_BUF_SIZE);  // FIX: Changed to uint8_t* for binary
-    if (!rx_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate memory for receive buffer");
+    uint8_t *tcp_rx_buffer = (uint8_t *)malloc(UART_BUF_SIZE * 2);  // 双倍缓冲防溢
+    if (!tcp_rx_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate TCP rx buffer");
         vTaskDelete(NULL);
     }
 
+    // Set non-blocking and larger recv buf
+    if (tcp_sock >= 0) {
+        int flags = fcntl(tcp_sock, F_GETFL, 0);
+        fcntl(tcp_sock, F_SETFL, flags | O_NONBLOCK);
+        int rcvbuf = 65536;  // 64KB, 防高吞吐
+        setsockopt(tcp_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        struct timeval rcv_timeout = {0, 1000};  // 1ms recv timeout
+        setsockopt(tcp_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
+    }
+
     while (1) {
-        if (!is_tcp_connected || tcp_sock == -1) {
-            vTaskDelay(500 / portTICK_PERIOD_MS); 
-                       esp_task_wdt_reset(); 
-                                  continue;
+        if (tcp_sock < 0 || !is_tcp_connected) {
+            vTaskDelay(100 / portTICK_PERIOD_MS);  // 慢轮询重连
+            esp_task_wdt_reset();
+            continue;
         }
 
-        int len = recv(tcp_sock, rx_buffer, UART_BUF_SIZE - 1, 0);
-        if (len < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                vTaskDelay(20 / portTICK_PERIOD_MS);  // FIX: Increased from 5ms to 20ms to reduce polling aggressiveness and allow lower-pri tasks (e.g., LED) to run
-                esp_task_wdt_reset();
-                continue;
-            }
-            ESP_LOGW(TAG, "Receive failed: errno %d, reconnecting...", errno); 
+        size_t total_received = 0;
+        while (total_received < sizeof(tcp_rx_buffer)) {  // 循环读所有可用数据
+            int len = recv(tcp_sock, tcp_rx_buffer + total_received, 
+                           sizeof(tcp_rx_buffer) - total_received, 0);
+            if (len > 0) {
+                total_received += len;
+                if (debug_mode) {
+                    ESP_LOGD(TAG, "Partial recv: +%d bytes (total %zu)", len, total_received);
+                }
+            } else if (len == 0) {
+                // 连接关闭
+                ESP_LOGI(TAG, "TCP connection closed by server");
+                close(tcp_sock);
+                tcp_sock = -1;
+                is_tcp_connected = false;
+                current_led_state = LED_FAST_BLINK;
+                break;  // 退出内循环，重连外层
+            } else {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // 无更多数据，退出内循环
+                    break;
+                } else {
+                    ESP_LOGE(TAG, "TCP recv error: %d", errno);
+                    close(tcp_sock);
+                    tcp_sock = -1;
                     is_tcp_connected = false;
-            close(tcp_sock);
-            tcp_sock = -1;
-            if (is_wifi_connected()) {
-                current_led_state = LED_FAST_BLINK;
-            } else {
-                current_led_state = LED_SLOW_BLINK;
-            }
-            vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
-            esp_task_wdt_reset();
-            continue;
-        } else if (len == 0) {
-            ESP_LOGI(TAG, "Connection closed by server, reconnecting...");
-            is_tcp_connected = false;
-            close(tcp_sock);
-            tcp_sock = -1;
-            if (is_wifi_connected()) {
-                current_led_state = LED_FAST_BLINK;
-            } else {
-                current_led_state = LED_SLOW_BLINK;
-            }
-            vTaskDelay(TCP_RETRY_DELAY_MS / portTICK_PERIOD_MS);
-            esp_task_wdt_reset();
-            continue;
-        }
-
-       if (debug_mode) {
-            if (len <= 200) {
-                char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};  // +1 for null
-                char *ptr = hex_buf;
-                for (int i = 0; i < len; i++) {
-                    ptr += sprintf(ptr, "%02X ", rx_buffer[i]); 
-                                }
-                ESP_LOGI(TAG, "Raw TCP receive buffer (hex): %s (length: %d)", hex_buf, len);
-            } else {
-                ESP_LOGI(TAG, "Large TCP packet received: %d bytes (hex log skipped)", len);
+                    current_led_state = LED_FAST_BLINK;
+                    break;
+                }
             }
         }
 
-        // Parse and process the received data
-        esp_err_t result = parse_command(tcp_sock, rx_buffer, len, true);
-        if (result != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to parse TCP command (len=%d)", len);
+        if (total_received > 0) {
+            // 转发到UART（用print_raw_data）
+            print_raw_data(tcp_rx_buffer, total_received);
+            if (debug_mode) {
+                ESP_LOGI(TAG, "Forwarded %zu bytes from TCP to UART", total_received);
+            }
+            // 检查缓冲水位（可选，加getsockopt(SO_RCVBUF)查询剩余）
         }
 
-        vTaskDelay(10 / portTICK_PERIOD_MS);  // FIX: Increased from 1ms to 10ms to yield more time to lower-priority tasks like LED
-        esp_task_wdt_reset(); 
-        }
+        vTaskDelay(1 / portTICK_PERIOD_MS);  // 1ms poll，高响应
+        esp_task_wdt_reset();
+    }
 
-    free(rx_buffer);
+    free(tcp_rx_buffer);
     vTaskDelete(NULL);
 }
 
