@@ -48,11 +48,12 @@ static const char *TAG = "slave";
 #define PORT 12345
 #define UDP_PORT PORT
 #define CONFIG_EXAMPLE_IPV4 1
-#define UART_BUF_SIZE (512)
+#define UART_BUF_SIZE (1024)
 #define TCP_RETRY_DELAY_MS 2000
 #define TCP_CONNECT_TIMEOUT_MS 10000
 #define TCP_KEEPALIVE_MS 10000
 #define RESPONSE_TIMEOUT_MS 5000
+#define SEND_RETRY_TIMEOUT_MS 50  // Short timeout for send retries in non-blocking mode
 
 #define LED_PIN GPIO_NUM_2
 
@@ -212,8 +213,7 @@ static void uart_init(uint32_t baud_rate, uint8_t stop_bits, uint8_t parity, uin
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "UART param config failed: %s", esp_err_to_name(err));
     }
-    // 增大 TX buffer 到 2048，避免 queue 满阻塞
-    err = uart_driver_install(UART_NUM_0, UART_BUF_SIZE * 2, UART_BUF_SIZE * 4, 0, NULL, 0);
+     err = uart_driver_install(UART_NUM_0, UART_BUF_SIZE * 2, UART_BUF_SIZE * 4, 0, NULL, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(err));
     }
@@ -388,30 +388,60 @@ static void print_raw_data(const uint8_t *data, size_t len)
         if (written != len) {
             ESP_LOGW(TAG, "UART write incomplete: %d/%zu bytes", written, len);
         }
-        // 移除 uart_wait_tx_done()：避免阻塞，允许异步 TX
-        xSemaphoreGive(raw_log_mutex);
+       xSemaphoreGive(raw_log_mutex);
     } else {
         uart_write_bytes(UART_NUM_0, (const char *)data, len);
-        // 移除 uart_wait_tx_done()
     }
 
-    // 喂 TWDT 后
     esp_task_wdt_reset();
 }
 
-/* TCP send data with optional response expectation */
+/* Optimized TCP send data with full payload transmission for non-blocking sockets */
 static esp_err_t tcp_send_data(int sock, const char *payload, size_t payload_len, char *rx_buffer, size_t rx_buffer_size, bool expect_response)
 {
-    int err = send(sock, payload, payload_len, 0);
-    if (err < 0) {
-        ESP_LOGE(TAG, "Error during sending: errno %d", errno);
-        return ESP_FAIL;
+    if (payload_len == 0) {
+        return ESP_OK;
+    }
+
+    // For sending UART data, ensure full transmission by looping in non-blocking mode
+    size_t total_sent = 0;
+    struct timeval send_timeout;
+    send_timeout.tv_sec = 0;
+    send_timeout.tv_usec = SEND_RETRY_TIMEOUT_MS * 1000;  // Short timeout per send attempt
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+
+    while (total_sent < payload_len) {
+        int to_send = payload_len - total_sent;
+        int sent = send(sock, payload + total_sent, to_send, 0);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Buffer full, yield briefly and retry
+                vTaskDelay(1 / portTICK_PERIOD_MS);
+                continue;
+            }
+            ESP_LOGE(TAG, "Error during sending: errno %d", errno);
+            return ESP_FAIL;
+        } else if (sent == 0) {
+            // Connection closed
+            ESP_LOGE(TAG, "Connection closed during send");
+            return ESP_FAIL;
+        }
+
+        total_sent += sent;
+        if (debug_mode && total_sent < payload_len) {
+            ESP_LOGD(TAG, "Partial send: %d/%zu bytes sent, retrying...", total_sent, payload_len);
+        }
+    }
+
+    if (debug_mode) {
+        ESP_LOGD(TAG, "Fully sent %zu bytes over TCP", payload_len);
     }
 
     if (!expect_response) {
         return ESP_OK;
     }
 
+    // For responses, use original logic
     struct timeval timeout;
     timeout.tv_sec = RESPONSE_TIMEOUT_MS / 1000;
     timeout.tv_usec = (RESPONSE_TIMEOUT_MS % 1000) * 1000;
@@ -437,7 +467,6 @@ static esp_err_t parse_command(int sock, const uint8_t *rx_buffer, size_t len, b
         return ESP_FAIL;
     }
 
-    // 快速路径：如果含 \r\n，假设命令；否则 passthrough
     bool is_likely_command = (memchr(rx_buffer, '\r', len) != NULL || memchr(rx_buffer, '\n', len) != NULL);
     if (!is_likely_command) {
         print_raw_data(rx_buffer, len);
@@ -765,8 +794,8 @@ static void tcp_receive_task(void *pvParameters)
     while (1) {
         if (!is_tcp_connected || tcp_sock == -1) {
             vTaskDelay(500 / portTICK_PERIOD_MS); 
-            esp_task_wdt_reset();  
-            continue;
+                       esp_task_wdt_reset(); 
+                                  continue;
         }
 
         int len = recv(tcp_sock, rx_buffer, UART_BUF_SIZE - 1, 0);
@@ -776,8 +805,8 @@ static void tcp_receive_task(void *pvParameters)
                 esp_task_wdt_reset();
                 continue;
             }
-            ESP_LOGW(TAG, "Receive failed: errno %d, reconnecting...", errno);  // ���þ�����־
-            is_tcp_connected = false;
+            ESP_LOGW(TAG, "Receive failed: errno %d, reconnecting...", errno); 
+                    is_tcp_connected = false;
             close(tcp_sock);
             tcp_sock = -1;
             if (is_wifi_connected()) {
@@ -803,14 +832,13 @@ static void tcp_receive_task(void *pvParameters)
             continue;
         }
 
-     
-        if (debug_mode) {
+       if (debug_mode) {
             if (len <= 200) {
                 char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};  // +1 for null
                 char *ptr = hex_buf;
                 for (int i = 0; i < len; i++) {
                     ptr += sprintf(ptr, "%02X ", rx_buffer[i]); 
-                }
+                                }
                 ESP_LOGI(TAG, "Raw TCP receive buffer (hex): %s (length: %d)", hex_buf, len);
             } else {
                 ESP_LOGI(TAG, "Large TCP packet received: %d bytes (hex log skipped)", len);
@@ -824,8 +852,8 @@ static void tcp_receive_task(void *pvParameters)
         }
 
         vTaskDelay(10 / portTICK_PERIOD_MS);  // FIX: Increased from 1ms to 10ms to yield more time to lower-priority tasks like LED
-        esp_task_wdt_reset();  
-    }
+        esp_task_wdt_reset(); 
+        }
 
     free(rx_buffer);
     vTaskDelete(NULL);
@@ -883,14 +911,13 @@ static void udp_receive_task(void *pvParameters)
             continue;
         }
 
-        // �Ż� debug hex log��len > 200 ʱ��ժҪ��������ѭ��
-        if (debug_mode) {
+         if (debug_mode) {
             if (len <= 200) {
                 char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};  // +1 for null
                 char *ptr = hex_buf;
                 for (int i = 0; i < len; i++) {
-                    ptr += sprintf(ptr, "%02X ", rx_buffer[i]);  // sprintf ֱ��׷�ӣ��� strlen
-                }
+                    ptr += sprintf(ptr, "%02X ", rx_buffer[i]); 
+                              }
                 ESP_LOGI(TAG, "Raw UDP receive buffer (hex): %s (length: %d)", hex_buf, len);
             } else {
                 ESP_LOGI(TAG, "Large UDP packet received: %d bytes (hex log skipped)", len);
@@ -903,9 +930,9 @@ static void udp_receive_task(void *pvParameters)
             ESP_LOGW(TAG, "Failed to parse UDP command (len=%d)", len);
         }
 
-        vTaskDelay(1 / portTICK_PERIOD_MS);  // ���̵� 1ms����� yield Ƶ��
-        esp_task_wdt_reset();  // ÿѭ��ι��
-    }
+        vTaskDelay(1 / portTICK_PERIOD_MS);  
+                esp_task_wdt_reset();  
+               }
 
     if (udp_sock >= 0) {
         close(udp_sock);
@@ -928,12 +955,18 @@ static void uart_tcp_bridge_task(void *pvParameters)
     while (1) {
         int len = uart_read_bytes(UART_NUM_0, uart_data, UART_BUF_SIZE - 1, 20 / portTICK_PERIOD_MS);
         if (len > 0) {
-            uart_data[len] = 0;
-            char *cmd = (char *)uart_data;
-            if (debug_mode) ESP_LOGI(TAG, "Raw UART input: %s", cmd);
+            // Do not null-terminate; treat as binary
+            if (debug_mode) {
+                char hex_buf[UART_BUF_SIZE * 3 + 1] = {0};
+                char *ptr = hex_buf;
+                for (int i = 0; i < len && i < 200; i++) {  // Limit hex log
+                    ptr += sprintf(ptr, "%02X ", uart_data[i]);
+                }
+                ESP_LOGI(TAG, "Raw UART input (hex, len=%d): %s", len, hex_buf);
+            }
 
             if (tcp_sock != -1) {
-                esp_err_t send_result = tcp_send_data(tcp_sock, cmd, len, rx_buffer, UART_BUF_SIZE, false);
+                esp_err_t send_result = tcp_send_data(tcp_sock, (const char *)uart_data, len, rx_buffer, UART_BUF_SIZE, false);
                 if (send_result != ESP_OK) {
                     ESP_LOGW(TAG, "Failed to send UART data over TCP, reconnecting...");
                     close(tcp_sock);
@@ -945,7 +978,7 @@ static void uart_tcp_bridge_task(void *pvParameters)
                         current_led_state = LED_SLOW_BLINK;
                     }
                 } else if (debug_mode) {
-                    ESP_LOGI(TAG, "Transparent message sent: %s", cmd);
+                    ESP_LOGI(TAG, "Transparent message fully sent: %d bytes", len);
                 }
             } else {
                 ESP_LOGE(TAG, "TCP not connected, cannot send data");
@@ -1006,7 +1039,6 @@ static void uart_tcp_bridge_task(void *pvParameters)
                 continue;
             }
 
-       
             int flags = fcntl(tcp_sock, F_GETFL, 0);
             if (flags < 0) {
                 ESP_LOGE(TAG, "fcntl F_GETFL failed: errno %d", errno);
@@ -1034,8 +1066,8 @@ static void uart_tcp_bridge_task(void *pvParameters)
         }
 
         vTaskDelay(10 / portTICK_PERIOD_MS);
-        esp_task_wdt_reset();  
-    }
+        esp_task_wdt_reset(); 
+        }
 
     if (tcp_sock != -1) {
         close(tcp_sock);
@@ -1264,9 +1296,7 @@ void app_main(void)
             return;
         }
     }
-
-
-    esp_task_wdt_init();
+   esp_task_wdt_init();
 
     // uart1_init();
     // esp_log_set_putchar(uart1_putchar);
