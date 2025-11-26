@@ -1,0 +1,66 @@
+{
+	"folders": [
+		{
+			"path": "../../../../../../../homeiot"
+		},
+		{
+			"path": "../../../../.."
+		},
+		{
+			"path": "../../../../../../esp-idf"
+		},
+		{
+			"path": "../../../../../../../axk/Ai-Thinker-WB2"
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"localsockethandle.h": "c",
+			"zigbee_cmd.h": "c",
+			"sl_zigbee_types.h": "c",
+			"zigbee-device-host.h": "c",
+			"ember-types.h": "c",
+			"zigbee-device-common.h": "c",
+			"select.h": "c",
+			"json_utils.h": "c",
+			"ezsp.h": "c",
+			"af.h": "c",
+			"userconfig.h": "c",
+			"network-creator.h": "c",
+			"cjson.h": "c",
+			"sl_status.h": "c",
+			"database.h": "c",
+			"z3handle.h": "c",
+			"system_error": "c",
+			"string_view": "c",
+			"privatez3convert.h": "c",
+			"stdbool.h": "c",
+			"array": "c",
+			"string": "c",
+			"assert.h": "c",
+			"algorithm": "c",
+			"stat.h": "c",
+			"functional": "c",
+			"chrono": "c",
+			"cstdint": "c",
+			"zap-type.h": "c",
+			"network-formation.h": "c",
+			"zigbee-device-stack.h": "c",
+			"signal.h": "c",
+			"string.h": "c",
+			"cstdlib": "c",
+			"network-creator-security.h": "c",
+			"format": "c",
+			"tusb_composite_main.h": "c",
+			"core_json.h": "c",
+			"unistd.h": "c",
+			"tusb_cdc_acm.h": "c",
+			"nvs_flash.h": "c",
+			"periph_ctrl.h": "c",
+			"errno.h": "c",
+			"gpiohandle.h": "c",
+			"nvs.h": "c",
+			"socket.h": "c"
+		}
+	}
+}
